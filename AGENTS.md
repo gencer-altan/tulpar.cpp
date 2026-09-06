@@ -72,6 +72,7 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 - A suspicion only justifies writing or running a test.
 - Before changing existing logic, prove the logic is wrong with an independent, isolated command: a terminal command, assertion, or mini-script.
 - If the suspicion cannot be proven with concrete output or error, do not change the code.
+- Do NOT simulate arithmetic or boundary checks in your head: verify any computation with a one-liner (e.g. `python3 -c "..."`) or run the test directly.
 
 ### Code and Commit Standards
 

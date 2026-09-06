@@ -890,3 +890,59 @@ CAVEAT
 
 VERDICT
 B1 audit: RESOLVED. The 2561 passes (repeats+warmup) and the 2.73 TB/s (SWA-window artifact) are both explained. Attention is not the decode bottleneck. Proceed to measurement-driven tuning (KNOB 1) with the expectation that any knob must show a MEASURED gain to be kept, since attention is ~0.73% of decode time.
+
+## EXP-017: KNOB 1 (byte0/nib hoist + __syncwarp removal) rejected
+
+PROBLEM
+Test KNOB 1 (hoist byte0/nib Q4_0 plane math, drop one __syncwarp) for a measured decode gain over the committed RDNA3 decode kernel, per the WS-2B "keep only measured gain" rule.
+
+EVIDENCE
+Bench: `llama-bench -m /home/gencer/models/qwen-v2/Qwen3.8-27B-UD-Q2_K_XL.gguf -ngl 999 -ctk q4_0 -ctv q4_0`, build d719f6370, llama-server stopped.
+- G1 (test-backend-ops FLASH_ATTN_EXT nr23=[6,1] nb=1 mask=0): 3/3 OK (kv 1024/8192/65536).
+- Dispatch (rocprofv3, p512 n4): fa grid (6144,4), combine (256,24), n=336. KNOB 1 does not change launch geometry (scalar micro-hygiene only).
+- A1 (KNOB 1 ON, rdna3 enabled), p131072 n512 -r 1: pp131072=240.74, tg512=23.76.
+- B1 (GGML_FA_DECODE_RDNA3_OFF=1, generic tile fallback), p131072 n512 -r 1: pp131072=241.35, tg512=23.90.
+- Long-tg (p512), rdna3 enabled: tg512=23.94, tg1024=23.88, tg5120=23.55, tg10240=23.17 (mild ~3% slowdown as context grows to ~10.7k).
+
+Raw log: /home/gencer/llama.cpp/experiments/fattn_decode_rdna3_bench/knob1_20260906_0859.log
+
+CHANGE
+Reverted only the KNOB 1 diff (byte0/nib hoist + __syncwarp removal) via `git checkout -- ggml/src/ggml-cuda/fattn-decode-rdna3.cu`, returning to clean commit 441e54b3b. The committed RDNA3 decode kernel is unchanged.
+
+RESULT
+KNOB 1 has no measurable decode gain. A1 (rdna3 + KNOB 1) tg512=23.76 vs B1 (generic) tg512=23.90: B1 is 0.14 t/s (0.6%) faster, within measurement noise. The scalar-loop hoisting and __syncwarp removal do not move the needle, as expected for a micro-hygiene edit on a memory-bound decode path.
+
+CAVEAT
+B1 uses GGML_FA_DECODE_RDNA3_OFF=1, which disables the entire RDNA3 path (generic tile fallback), not a clean KNOB 1-off. So this is a "RDNA3 kernel vs generic" comparison, not an isolated KNOB 1 on/off. The conclusion (no measurable gain) still holds because rdna3 + KNOB 1 is at best equal to the generic path.
+
+VERDICT
+KNOB 1: REJECTED (no measurable delta over baseline; within noise). Revert only the KNOB 1 diff. Proceed to KNOB 2 (TILE=128) or KNOB 3 (GQA head batching) to attack the 6x KV traffic multiplier and barrier frequency.
+
+## EXP-018: KNOB 2 (TILE=128) rejected
+
+PROBLEM
+Test KNOB 2 (TILE 64->128, S_LDSS 65->129, softmax 2->4 tokens/lane, P_lds 2->4 tokens/lane) for a measured decode gain over the generic tile fallback, per the WS-2B "keep only measured gain" rule. Goal: halve the __syncthreads() barrier count per KV tile by processing 128 tokens per tile.
+
+EVIDENCE
+Bench: `llama-bench -m /home/gencer/models/qwen-v2/Qwen3.8-27B-UD-Q2_K_XL.gguf -ngl 999 -ctk q4_0 -ctv q4_0`, llama-server stopped.
+- G1 (test-backend-ops FLASH_ATTN_EXT nr23=[6,1] nb=1 mask=0): 3/3 OK (kv 1024/8192/65536).
+- Resource check (rocprofv3 runtime, TILE=128): private_segment_size (scratch) = 0, group_segment_size (LDS) = 4652 B (4.54 KB, <= 16 KB budget), arch_vgpr_count = 112 (baseline TILE=64 was 88; over the 96 VGPR budget).
+- A (KNOB 2 ON, rdna3 enabled), pp8192 n128 -r 1: pp8192=562.82, tg128=23.21.
+- B (GGML_FA_DECODE_RDNA3_OFF=1, generic tile fallback), pp8192 n128 -r 1: pp8192=562.79, tg128=23.26.
+- pp8192 used because the Qwen3.5 SWA window caps decode attention at ~512 tokens (EXP-016), so pp8192 fully saturates the decode attention workload; a final 131k confirmation is deferred to the end of WS-2B if KNOB 2 were kept.
+
+Raw log: /home/gencer/llama.cpp/experiments/fattn_decode_rdna3_bench/knob2_20260906_1554.log
+
+CHANGE
+Reverted the KNOB 2 diff (TILE=128) via `git checkout -- ggml/src/ggml-cuda/fattn-decode-rdna3.cu`, returning to clean commit 441e54b3b (TILE=64, 81 static VGPR). The committed RDNA3 decode kernel is unchanged.
+
+RESULT
+KNOB 2 has no measurable decode gain. A (TILE=128) tg128=23.21 vs B (generic) tg128=23.26: A is 0.05 t/s (0.2%) slower, within measurement noise. Doubling the tile did not pay for itself: the extra register pressure (VGPR 88 -> 112) offsets the halved barrier count on this memory-bound decode path.
+
+CAVEAT
+- Single -r 1 -n 128 run; the 0.05 t/s delta is within noise, so the direction (slight regression) is not statistically firm, but there is no evidence of a gain.
+- B uses GGML_FA_DECODE_RDNA3_OFF=1 (whole RDNA3 path off), not an isolated KNOB 2-off, same caveat as EXP-017.
+- VGPR 112 exceeds the 96 budget; even a marginal gain would have required reconciling the register regression.
+
+VERDICT
+KNOB 2: REJECTED (no measurable delta over baseline; within noise, and VGPR over budget). Revert only the KNOB 2 diff. Proceed to KNOB 3 (GQA head batching) to attack the 6x KV traffic multiplier.
