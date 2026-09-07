@@ -74,6 +74,18 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 - If the suspicion cannot be proven with concrete output or error, do not change the code.
 - Do NOT simulate arithmetic or boundary checks in your head: verify any computation with a one-liner (e.g. `python3 -c "..."`) or run the test directly.
 
+### Bias for Action: Code Over Mental Compilation
+
+When optimizing kernels, you may design the architecture (structs, pipeline logic) in your head. But:
+
+- Do NOT act as a human compiler: you cannot mentally predict exact VGPR usage, struct byte alignment, or register spills. Do not debate them in your internal monologue.
+- Write-now rule: once you have a logically sound design, stop debating and write the code immediately.
+- Hardware is the oracle: let the compiler (`make`) and the hardware (benchmark) answer your doubts. If the kernel spills to scratch memory, you will see it in the build/test output and can optimize only after that empirical proof.
+
+### Bias for Action: Debug Over Mental Guessing
+
+When a script, compiler, or test fails, DO NOT retreat into your thoughts to guess why. Your immediate next thought MUST be a concrete tool call to print variables, inspect the exact output, or fix the script. Mental debugging of code failures is strictly forbidden.
+
 ### Code and Commit Standards
 
 These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:

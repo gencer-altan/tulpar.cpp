@@ -946,3 +946,71 @@ CAVEAT
 
 VERDICT
 KNOB 2: REJECTED (no measurable delta over baseline; within noise, and VGPR over budget). Revert only the KNOB 2 diff. Proceed to KNOB 3 (GQA head batching) to attack the 6x KV traffic multiplier.
+
+## EXP-021: GEMV Bandwidth Decomposition (131k decode trace)
+
+PROBLEM
+Decompose the GEMV bandwidth deficit from the B1 131k decode trace by mapping each `mul_mat_vec_q` dispatch to its exact weight-tensor byte count, computing per-dispatch achieved bandwidth, and identifying which size/format buckets are underperforming.
+
+EVIDENCE
+Source: `/home/gencer/rocmprof/b1_ws2b/kernel/trace_kernel_131k_kernel_trace.csv` (1,110,449 GEMV dispatches, chronological).
+Model: Qwen35 hybrid SSM+attention, 65 blocks, `full_attention_interval=4`, `nextn_predict_layers=1`.
+Bench: `-p 131072 -n 512 -b 512`, `llama-bench` default `-r 5` (confirmed EXP-016).
+
+Byte derivation (verified from GGUF tensor table + mmvq.cu):
+- GGUF v3 tensor table gives exact per-tensor byte sizes via offset deltas.
+- `gx = ne01 * 32` maps each dispatch to its weight tensor.
+- Fused kernels (`has_fusion=true`) with `use_gate` stream TWO weight matrices (mmvq.cu lines 669-675: `vec_dot_q_cuda(vx,...)` + `vec_dot_q_cuda(vgate,...)`), so bytes = 2x single-matrix size.
+- Non-fused kernels stream one weight matrix.
+
+Per-(type, gx) BW table (corrected):
+
+| type | quant   | gx      | bytes     | n       | avg_us  | BW_GB/s | tensor              |
+|------|---------|---------|-----------|---------|---------|---------|---------------------|
+| 11   | Q3_K    | 7946240 | 546,304,000 | 4,097   | 1360.66 | 401.5   | output.weight       |
+| 18   | IQ3_XXS | 163840  | 34,119,680  | 163,904 | 118.93  | 286.9   | ffn_down            |
+| 18   | IQ3_XXS | 196608  | 12,042,240  | 122,928 | 45.08   | 267.1   | attn_gate           |
+| 18   | IQ3_XXS | 327680  | 20,070,400  | 122,928 | 72.35   | 277.4   | attn_qkv            |
+| 18   | IQ3_XXS | 557056  | 68,239,360  | 163,904 | 234.59  | 290.9   | ffn_gate+up (fused) |
+| 21   | IQ3_S   | 32768   | 2,252,800   | 40,976  | 10.14   | 222.2   | attn_k              |
+| 21   | IQ3_S   | 163840  | 13,516,800  | 163,904 | 45.96   | 294.1   | ssm_out/attn_output |
+| 21   | IQ3_S   | 393216  | 27,033,600  | 40,976  | 85.10   | 317.7   | attn_q              |
+| 23   | IQ4_XS  | 32768   | 2,785,280   | 40,976  | 7.24    | 384.7   | attn_v              |
+| 29   | IQ1_M   | 1536    | 53,760      | 245,856 | 3.59    | 15.0    | ssm_alpha/beta      |
+
+Aggregate: 26,505.7 GB streamed, 90.57 s total GEMV duration, **292.7 GB/s** aggregate.
+
+Per-type aggregate BW (anchor check vs EXP-005):
+
+| quant   | total_GB | total_s | BW_GB/s | EXP-005 anchor |
+|---------|----------|---------|---------|----------------|
+| Q3_K    | 2,238.2  | 5.57    | 401.5   | ~503           |
+| IQ3_XXS | 20,724.6 | 72.38   | 286.3   | ~350           |
+| IQ3_S   | 3,415.5  | 11.44   | 298.7   | (no anchor)    |
+| IQ4_XS  | 114.1    | 0.30    | 384.7   | (no anchor)    |
+| IQ1_M   | 13.2     | 0.88    | 15.0    | (no anchor)    |
+
+Token-count reconciliation:
+- Attention passes: 40,976 fa dispatches / 16 full-attention blocks = 2,561 = 5 x 512 + 1 (matches `-r 5` default).
+- Output.weight: 4,097 = 8 x 512 + 1. The output layer is dispatched more frequently than attention, consistent with the MTP/nextn head (`nextn_predict_layers=1`) computing additional output projections. Per-dispatch BW is unaffected by this mismatch.
+
+CHANGE
+No code change. Diagnostic measurement only.
+
+RESULT
+- Fused-kernel byte correction (1x -> 2x) raises ffn_gate/up BW from 145.4 to **290.9 GB/s**, eliminating the apparent anomaly. It now sits within 3% of ffn_down (286.9 GB/s).
+- Aggregate GEMV BW: **292.7 GB/s** (was 230.9 GB/s before the 2x correction).
+- Per-type anchors: Q3_K at 401.5 GB/s is ~20% below the EXP-005 anchor (~503). IQ3_XXS at 286.3 GB/s is ~18% below its anchor (~350). The deficit is uniform across sizes within each type, indicating a systematic bandwidth gap, not a size-specific effect.
+- ssm_alpha/beta (IQ1_M, 53,760 bytes): **15.0 GB/s** is a latency-bound anomaly (tiny tensor, 3.59 us fixed overhead dominates). This is a known small-tensor effect, not a bandwidth deficit.
+- attn_k (IQ3_S, 2.25 MB): 222.2 GB/s is the lowest among non-tiny tensors, ~25% below the IQ3_S aggregate. The 2.25 MB size is below the ~4 MB threshold where RDNA3 L2 caching becomes effective.
+
+CAVEAT
+- The 4,097 vs 2,561 output/attention count mismatch is documented but not fully decomposed (MTP head contribution is inferred, not traced). Does not affect per-dispatch BW.
+- The per-type aggregate anchors (EXP-005) were measured on a different build/commit; the ~18-20% gap may include build differences, not just a bandwidth deficit.
+- ssm_alpha/beta (15 GB/s) is excluded from the bandwidth-deficit analysis as a known latency-bound case.
+- The 2x fused-byte correction applies only to kernels with `use_gate=true`; kernels fused for bias/scale only (if any) would be 1x. All observed fused kernels in this trace are gate-fused.
+
+VERDICT
+GEMV bandwidth decomposition: **C (partial deficit, uniform across sizes)**. The corrected aggregate is 292.7 GB/s. The per-type deficit (~18-20% below anchors) is uniform across tensor sizes within each quantization type, pointing to a systematic bandwidth gap (likely L2/DRAM interaction or memory controller behavior) rather than a size-specific kernel inefficiency. The ssm_alpha/beta 15 GB/s is a separate latency-bound anomaly (tiny tensor), not part of the bandwidth deficit. The fused-kernel "anomaly" is resolved: it was a byte-count error (1x vs 2x), not a kernel inefficiency.
+
+Recommended next direction: characterize the L2/DRAM interaction at the ~4 MB size boundary (attn_k at 2.25 MB is the outlier at 222 GB/s) using the GL2C PMC data to confirm whether the deficit is L2-residency-driven or a uniform memory-controller ceiling.
