@@ -1014,3 +1014,29 @@ VERDICT
 GEMV bandwidth decomposition: **C (partial deficit, uniform across sizes)**. The corrected aggregate is 292.7 GB/s. The per-type deficit (~18-20% below anchors) is uniform across tensor sizes within each quantization type, pointing to a systematic bandwidth gap (likely L2/DRAM interaction or memory controller behavior) rather than a size-specific kernel inefficiency. The ssm_alpha/beta 15 GB/s is a separate latency-bound anomaly (tiny tensor), not part of the bandwidth deficit. The fused-kernel "anomaly" is resolved: it was a byte-count error (1x vs 2x), not a kernel inefficiency.
 
 Recommended next direction: characterize the L2/DRAM interaction at the ~4 MB size boundary (attn_k at 2.25 MB is the outlier at 222 GB/s) using the GL2C PMC data to confirm whether the deficit is L2-residency-driven or a uniform memory-controller ceiling.
+
+## EXP-022: K-LUT (IQ3_XXS codebook to LDS)
+
+PROBLEM
+Move the 1 KB `iq3xxs_grid` codebook from global/L2 into LDS in the IQ3_XXS `mul_mat_vec_q` decode kernel (replace per-lane global gather with `ds_read_b32`) to cut LUT gather latency and raise type-18 decode BW.
+
+EVIDENCE
+- Baseline (clean HEAD `1bbd07215`): type-18 aggregate BW 286.4 GB/s, tg 23.72 ± 0.41 t/s, pp8192 568.97 t/s.
+- Resource (type-18 decode): VGPR 80/96, SGPR 128, LDS 0, scratch 0, occupancy ~56.4%/56.9%.
+
+CHANGE
+- `vecdotq.cuh`: split `vec_dot_iq3_xxs_q8_1` into `vec_dot_iq3_xxs_q8_1_lut` (takes a LUT pointer) + a 4-arg wrapper delegating to it with the global `iq3xxs_grid` (MoE path unchanged).
+- `mmvq.cu`: add `__shared__ uint32_t s_lut[256];` + load loop + `__syncthreads()` for IQ3_XXS; special-case the call site to use the LUT version with `s_lut`.
+
+RESULT
+- Correctness: `test-backend-ops` MUL_MAT iq3_xxs 11/11 PASS; full MUL_MAT 1193/1193 PASS.
+- Resource (type-18): VGPR 80/96 (unchanged), SGPR 128, LDS 0 -> 1024 (+1 KB, at limit), scratch 0.
+- BW (type-18): aggregate 286.4 -> 279.3 GB/s (-2.5%); all buckets regressed (-1.3% to -4.6%).
+- tg: 23.72 -> 23.67 t/s (flat, -0.2%).
+- pp8192: 568.97 -> 570.96 t/s (+0.35%, no regression).
+
+CAVEAT
+- The `__syncthreads()` + LDS load overhead outweighs the LUT gather-latency win. The global `iq3xxs_grid` is already L2-resident (1 KB, hot), so the global gather was not the bottleneck.
+
+VERDICT
+REVERT. BW -2.5% (NOT +15%), tg flat (NOT +5%). Decision rule (BW >= +15% AND tg >= +5%) fails. GEMV inner-loop micro-tuning is PERMANENTLY CLOSED. Working tree reverted to `1bbd07215`.

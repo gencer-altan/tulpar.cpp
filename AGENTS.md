@@ -267,3 +267,9 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+## Universal Anti-Paralysis Protocol
+
+1. NO MENTAL DATA ENGINEERING: If you encounter a discrepancy between current data (e.g., DB queries, logs) and historical records, DO NOT attempt to reconcile them purely in your internal monologue.
+2. THE "GOING IN CIRCLES" CIRCUIT BREAKER: If you catch yourself writing phrases like "Let me reconsider", "Actually, wait", or "I'm going in circles" more than twice, YOU ARE VIOLATING PROTOCOL.
+3. MANDATORY ACTION: The instant you feel confused or stuck in a paradox, you MUST stop thinking and write a diagnostic tool call (Python, SQL, bash) to print the raw data or make a hard assumption and test it. Let the terminal output resolve your confusion.
