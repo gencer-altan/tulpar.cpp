@@ -733,7 +733,7 @@ namespace ggml_cuda_mma {
 #pragma unroll
         for (int l = 0; l < tile_float.ne; ++l) {
             float tmp[2];
-            int i = threadIdx.x / 16;
+            int i = (threadIdx.x % 32) / 16;
             tmp[i] = tile_float.x[l];
             i ^= 1;
             tmp[i] = __shfl_xor_sync(0xFFFFFFFF, tile_float.x[l], 16, WARP_SIZE);
