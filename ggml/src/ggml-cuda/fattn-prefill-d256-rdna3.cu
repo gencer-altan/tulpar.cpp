@@ -21,12 +21,9 @@ static __device__ __forceinline__ half2 dequant_nibbles(const uint32_t p, const 
     return __hfma2(__hmul2(__hmul2(n, make_half2(1024.0f, 1024.0f)), make_half2(16384.0f, 16384.0f)), d_h2, dm_h2);
 }
 
-// Dequantize one Q4_0 block (32 dims) into 16 half2 at tk.
+// Dequantize 4 packed Q4_0 nibble-dwords (32 dims) into 16 half2 at tk.
 // Split-plane Q4_0: byte b holds dim b (low nibble) and dim b+16 (high nibble).
-static __device__ __forceinline__ void dequant_q4_0_h2(const block_q4_0 * bq, half2 * tk) {
-    const half2 d_h2  = __half2half2(bq->d);
-    const half2 dm_h2 = __half2half2(__float2half(-8.0f * __half2float(bq->d)));
-    const uint32_t * qs32 = (const uint32_t *) bq->qs;
+static __device__ __forceinline__ void dequant_q4_0_h2_qs(const uint32_t * qs32, const half2 d_h2, const half2 dm_h2, half2 * tk) {
     #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const uint32_t v  = qs32[j];
@@ -44,10 +41,28 @@ static __device__ __forceinline__ void dequant_q4_0_h2(const block_q4_0 * bq, ha
     }
 }
 
+// Load one raw Q4_0 block (18 bytes: ggml_half d + 16 bytes of qs) into 5 dwords:
+// p[0] holds d in the low half, p[1..4] hold the qs dwords (bytes 2..17 of the block).
+static __device__ __forceinline__ void load_q4_0_block_regs(const char * pb, uint32_t * p) {
+    p[0] = *reinterpret_cast<const uint16_t *>(pb);
+    p[1] = *reinterpret_cast<const uint32_t *>(pb + 2);
+    p[2] = *reinterpret_cast<const uint32_t *>(pb + 6);
+    p[3] = *reinterpret_cast<const uint32_t *>(pb + 10);
+    p[4] = *reinterpret_cast<const uint32_t *>(pb + 14);
+}
+
+// Dequantize one raw Q4_0 block held in 5 dwords into 16 half2 at tk.
+static __device__ __forceinline__ void dequant_q4_0_h2_regs(const uint32_t * p, half2 * tk) {
+    const half d = (*reinterpret_cast<const half2 *>(p)).x;
+    dequant_q4_0_h2_qs(p + 1, __half2half2(d), __half2half2(__float2half(-8.0f * __half2float(d))), tk);
+}
+
 // WMMA prefill Flash Attention for RDNA3 (gfx1101), head_dim 256, Q4_0 KV, GQA ratio 6.
 // 192 threads (6 warps of Wave32). 1 block = 1 KV head x 96 Q cols (16 tokens x 6 GQA heads).
 // KV_TILE = 16 (16 KV rows per tile). LDS layout: tile_KV is SHARED between full K and full V
 // (8.44 KB), total LDS = 58.5 KB (<64 KB), zero scratch spill, 2x wave occupancy vs KV_TILE = 64.
+// Raw K/V blocks (18 bytes each) are prefetched into registers (5 dwords per thread)
+// ahead of the barriers, so global load latency overlaps WMMA compute.
 // 4 __syncthreads() per 16-token KV block: tile_KV is reused for K and V,
 // so all reads must complete before each overwrite.
 
@@ -145,19 +160,31 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
 
     const char * K_head = K + nb12 * kv_head;
     const char * V_head = V + nb22 * kv_head;
+    const int n_kv_blocks = (ne11 + KV_TILE - 1) / KV_TILE;
 
-    for (int kb = 0; kb < (ne11 + KV_TILE - 1) / KV_TILE; ++kb) {
+    // Register prefetch buffers: one raw Q4_0 block per thread, packed into 5 dwords.
+    // Load latency is hidden by the WMMA compute between the barrier that issues the load
+    // and the barrier after which the data is consumed.
+    uint32_t pref_k[5];
+    uint32_t pref_v[5];
+    {
+        const int row = tid >> 3;
+        const int b   = tid & 7;
+        if (tid < 128 && row < min(KV_TILE, ne11)) {
+            load_q4_0_block_regs((const char *)(K_head + nb11 * row + b * sizeof(block_q4_0)), pref_k);
+        }
+    }
+
+    for (int kb = 0; kb < n_kv_blocks; ++kb) {
         const int k_sup = min(KV_TILE, ne11 - kb * KV_TILE);
 
-        // 2. Cooperative dequantize FULL K (128 blocks) into tile_KV + load mask
+        // 2. Unpack prefetched raw K into tile_KV + load mask
         if (tid < 128) {
             const int row = tid >> 3;
             const int b   = tid & 7;
-            const char * Kb = K_head + nb11 * (kb * KV_TILE + row);
-            const block_q4_0 * bq = (const block_q4_0 *)(Kb + b * sizeof(block_q4_0));
             half2 * tk = tile_KV + row * S_KV + b * 16;
             if (row < k_sup) {
-                dequant_q4_0_h2(bq, tk);
+                dequant_q4_0_h2_regs(pref_k, tk);
             } else {
                 #pragma unroll
                 for (int l = 0; l < 16; ++l) {
@@ -180,6 +207,15 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         }
 
         __syncthreads(); // BARRIER 1: Full K and Mask ready
+
+        // Prefetch raw V of this tile: in flight while WMMA computes Q x K^T
+        if (tid < 128) {
+            const int row = tid >> 3;
+            const int b   = tid & 7;
+            if (row < k_sup) {
+                load_q4_0_block_regs((const char *)(V_head + nb21 * (kb * KV_TILE + row) + b * sizeof(block_q4_0)), pref_v);
+            }
+        }
 
         // 3. WMMA Q x K^T: All 6 warps active
         T_C_KQ KQ_C[1];
@@ -249,17 +285,15 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         B[0] = get_half2(KQ_C[0]);
 
         // K reads done, tile_KV can now be overwritten with V
-        __syncthreads();
+        __syncthreads(); // BARRIER 2
 
-        // 5. Cooperative dequantize FULL V into tile_KV (safely overwriting K)
+        // 5. Unpack prefetched raw V into tile_KV (safely overwriting K)
         if (tid < 128) {
             const int row = tid >> 3;
             const int b   = tid & 7;
-            const char * Vb = V_head + nb21 * (kb * KV_TILE + row);
-            const block_q4_0 * bq = (const block_q4_0 *)(Vb + b * sizeof(block_q4_0));
             half2 * tv = tile_KV + row * S_KV + b * 16;
             if (row < k_sup) {
-                dequant_q4_0_h2(bq, tv);
+                dequant_q4_0_h2_regs(pref_v, tv);
             } else {
                 #pragma unroll
                 for (int l = 0; l < 16; ++l) {
@@ -268,7 +302,17 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
             }
         }
 
-        __syncthreads(); // BARRIER 2: Full V ready
+        __syncthreads(); // BARRIER 3: Full V ready
+
+        // Prefetch raw K of the next tile: in flight while WMMA computes P x V
+        if (kb + 1 < n_kv_blocks) {
+            const int row = tid >> 3;
+            const int b   = tid & 7;
+            const int k_sup_next = min(KV_TILE, ne11 - (kb + 1) * KV_TILE);
+            if (tid < 128 && row < k_sup_next) {
+                load_q4_0_block_regs((const char *)(K_head + nb11 * ((kb + 1) * KV_TILE + row) + b * sizeof(block_q4_0)), pref_k);
+            }
+        }
 
         // 6. WMMA P x V: Accumulate into VKQ_C (FP32)
         #pragma unroll
@@ -279,7 +323,7 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         }
 
         // V reads done, next KV block can overwrite tile_KV with K
-        __syncthreads();
+        __syncthreads(); // BARRIER 4
     }
 
     // Epilogue: Normalize and write output to global memory
