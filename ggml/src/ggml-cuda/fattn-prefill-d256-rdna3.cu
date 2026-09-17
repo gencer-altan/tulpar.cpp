@@ -45,13 +45,14 @@ static __device__ __forceinline__ void dequant_q4_0_h2(const block_q4_0 * bq, ha
 }
 
 // WMMA prefill Flash Attention for RDNA3 (gfx1101), head_dim 256, Q4_0 KV, GQA ratio 6.
-// 96 threads (3 warps of Wave32). 1 block = 1 KV head x 48 Q cols (8 tokens x 6 GQA heads).
-// LDS layout: tile_KV is SHARED between full K and full V (33 KB), total LDS = 58.875 KB (<64 KB).
-// 4 __syncthreads() per 64-token KV block: tile_KV is reused for K and V,
+// 192 threads (6 warps of Wave32). 1 block = 1 KV head x 96 Q cols (16 tokens x 6 GQA heads).
+// KV_TILE = 16 (16 KV rows per tile). LDS layout: tile_KV is SHARED between full K and full V
+// (8.44 KB), total LDS = 58.5 KB (<64 KB), zero scratch spill, 2x wave occupancy vs KV_TILE = 64.
+// 4 __syncthreads() per 16-token KV block: tile_KV is reused for K and V,
 // so all reads must complete before each overwrite.
 
 template <int DKV>
-__launch_bounds__(96, 1)
+__launch_bounds__(192, 1)
 static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         const float2 * Q,
         const char   * K,
@@ -79,16 +80,16 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
     using T_B_VKQ = tile<16, 8,  half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;
 
-    constexpr int N_TOKENS = 8;
+    constexpr int N_TOKENS = 16;
     constexpr int N_GQA    = 6;
-    constexpr int NCOLS    = N_TOKENS * N_GQA; // 48 cols
-    constexpr int KV_TILE  = 64;
+    constexpr int NCOLS    = N_TOKENS * N_GQA; // 96 cols
+    constexpr int KV_TILE  = 16;
     constexpr int N_CH     = DKV / 64;         // 4 chunks
     constexpr int S_Q      = DKV / 2 + 4;      // 132
     constexpr int S_KV     = DKV / 2 + 4;      // 132 (full head dim in half2 + 4 pad)
-    constexpr int S_MASK   = KV_TILE + 8;      // 72
+    constexpr int S_MASK   = KV_TILE + 8;      // 24
 
-    // Total LDS = 25,344 + 33,792 + 1,152 = 60,288 bytes (58.875 KB < 65,536 bytes)
+    // Total LDS = 50,688 + 8,448 + 768 = 59,904 bytes (58.5 KB < 65,536 bytes)
     // 16-byte alignment keeps every row base legal for ds_read_b128 (all row strides are 16B multiples).
     __shared__ __align__(16) half2 tile_Q   [NCOLS    * S_Q];
     __shared__ __align__(16) half2 tile_KV  [KV_TILE  * S_KV];
@@ -96,15 +97,15 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
 
     const int tid     = threadIdx.x;
     const int lane    = tid & 31;
-    const int warp    = tid >> 5; // Exactly 3 warps: 0, 1, 2
+    const int warp    = tid >> 5; // Exactly 6 warps: 0..5
     const int qcol    = warp * 16 + (lane & 15);
     const int ntile   = (ne01 + N_TOKENS - 1) / N_TOKENS;
     const int jt      = blockIdx.x % ntile;
     const int kv_head = blockIdx.x / ntile;
 
-    // 1. Cooperative Load Q (48 cols x 128 half2 = 6144 elements / 96 threads = 64 per thread)
+    // 1. Cooperative Load Q (96 cols x 128 half2 = 12288 elements / 192 threads = 64 per thread)
     {
-        const int gc = tid >> 3; // 12 col-groups (4 cols each)
+        const int gc = tid >> 3; // 24 col-groups (4 cols each)
         const int gk = tid & 7;  // 8 k-groups (16 k's each)
         #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -148,32 +149,29 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
     for (int kb = 0; kb < (ne11 + KV_TILE - 1) / KV_TILE; ++kb) {
         const int k_sup = min(KV_TILE, ne11 - kb * KV_TILE);
 
-        // 2. Cooperative dequantize FULL K (512 blocks) into tile_KV + load mask
-        for (int it = 0; it < 6; ++it) {
-            const int gidx = tid + it * 96;
-            if (gidx < 512) {
-                const int row = gidx >> 3;
-                const int b   = gidx & 7;
-                const char * Kb = K_head + nb11 * (kb * KV_TILE + row);
-                const block_q4_0 * bq = (const block_q4_0 *)(Kb + b * sizeof(block_q4_0));
-                half2 * tk = tile_KV + row * S_KV + b * 16;
-                if (row < k_sup) {
-                    dequant_q4_0_h2(bq, tk);
-                } else {
-                    #pragma unroll
-                    for (int l = 0; l < 16; ++l) {
-                        tk[l] = make_half2(0.0f, 0.0f);
-                    }
+        // 2. Cooperative dequantize FULL K (128 blocks) into tile_KV + load mask
+        if (tid < 128) {
+            const int row = tid >> 3;
+            const int b   = tid & 7;
+            const char * Kb = K_head + nb11 * (kb * KV_TILE + row);
+            const block_q4_0 * bq = (const block_q4_0 *)(Kb + b * sizeof(block_q4_0));
+            half2 * tk = tile_KV + row * S_KV + b * 16;
+            if (row < k_sup) {
+                dequant_q4_0_h2(bq, tk);
+            } else {
+                #pragma unroll
+                for (int l = 0; l < 16; ++l) {
+                    tk[l] = make_half2(0.0f, 0.0f);
                 }
             }
         }
 
         if (mask != nullptr) {
-            for (int it = 0; it < 6; ++it) {
-                const int midx = tid + it * 96;
-                if (midx < 512) {
-                    const int j  = midx >> 6;
-                    const int i  = midx & 63;
+            for (int it = 0; it < 2; ++it) {
+                const int midx = tid + it * 192;
+                if (midx < 256) {
+                    const int j  = midx >> 4;
+                    const int i  = midx & 15;
                     const int jv = jt * N_TOKENS + j;
                     tile_mask[j * S_MASK + i] = (i < k_sup && jv < ne01) ?
                         mask[(int64_t) jv * stride_mask + kb * KV_TILE + i] : half(0.0f);
@@ -183,14 +181,11 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
 
         __syncthreads(); // BARRIER 1: Full K and Mask ready
 
-        // 3. WMMA Q x K^T: All 3 warps active
-        T_C_KQ KQ_C[4];
+        // 3. WMMA Q x K^T: All 6 warps active
+        T_C_KQ KQ_C[1];
         #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                KQ_C[r].x[l] = 0.0f;
-            }
+        for (int l = 0; l < T_C_KQ::ne; ++l) {
+            KQ_C[0].x[l] = 0.0f;
         }
 
         #pragma unroll
@@ -199,12 +194,9 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
             for (int k0 = 0; k0 < 32; k0 += 8) {
                 T_B_KQ Q_B;
                 load_ldmatrix(Q_B, tile_Q + warp * 16 * S_Q + ch * 32 + k0, S_Q);
-                #pragma unroll
-                for (int r = 0; r < 4; ++r) {
-                    T_A_KQ A;
-                    load_ldmatrix(A, tile_KV + r * 16 * S_KV + ch * 32 + k0, S_KV);
-                    mma(KQ_C[r], A, Q_B);
-                }
+                T_A_KQ A;
+                load_ldmatrix(A, tile_KV + ch * 32 + k0, S_KV);
+                mma(KQ_C[0], A, Q_B);
             }
         }
 
@@ -212,23 +204,17 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         if (mask != nullptr) {
             const int j = qcol / N_GQA;
             #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                #pragma unroll
-                for (int l = 0; l < T_C_KQ::ne; ++l) {
-                    const int i = r * 16 + 2*l + (lane >> 4);
-                    KQ_C[r].x[l] += __half2float(tile_mask[j * S_MASK + i]);
-                }
+            for (int l = 0; l < T_C_KQ::ne; ++l) {
+                const int i = 2*l + (lane >> 4);
+                KQ_C[0].x[l] += __half2float(tile_mask[j * S_MASK + i]);
             }
         }
 
         float KQ_max_new = KQ_max;
         #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (r * 16 + 2*l + (lane >> 4) < k_sup) {
-                    KQ_max_new = fmaxf(KQ_max_new, KQ_C[r].x[l] + FATTN_KQ_MAX_OFFSET);
-                }
+        for (int l = 0; l < T_C_KQ::ne; ++l) {
+            if (2*l + (lane >> 4) < k_sup) {
+                KQ_max_new = fmaxf(KQ_max_new, KQ_C[0].x[l] + FATTN_KQ_MAX_OFFSET);
             }
         }
         KQ_max_new = fmaxf(KQ_max_new, __shfl_xor_sync(0xFFFFFFFF, KQ_max_new, 16, 32));
@@ -247,46 +233,37 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
 
         float rowsum_add = 0.0f;
         #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            #pragma unroll
-            for (int l = 0; l < T_C_KQ::ne; ++l) {
-                if (r * 16 + 2*l + (lane >> 4) < k_sup) {
-                    KQ_C[r].x[l] = fa_expf(KQ_C[r].x[l] - KQ_max);
-                    rowsum_add += KQ_C[r].x[l];
-                } else {
-                    KQ_C[r].x[l] = 0.0f;
-                }
+        for (int l = 0; l < T_C_KQ::ne; ++l) {
+            if (2*l + (lane >> 4) < k_sup) {
+                KQ_C[0].x[l] = fa_expf(KQ_C[0].x[l] - KQ_max);
+                rowsum_add += KQ_C[0].x[l];
+            } else {
+                KQ_C[0].x[l] = 0.0f;
             }
         }
         rowsum_add += __shfl_xor_sync(0xFFFFFFFF, rowsum_add, 16, 32);
         KQ_rowsum = KQ_max_scale * KQ_rowsum + rowsum_add;
 
         // Convert scores to B fragments for P x V
-        T_B_VKQ B[4];
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            B[k] = get_half2(KQ_C[k]);
-        }
+        T_B_VKQ B[1];
+        B[0] = get_half2(KQ_C[0]);
 
         // K reads done, tile_KV can now be overwritten with V
         __syncthreads();
 
         // 5. Cooperative dequantize FULL V into tile_KV (safely overwriting K)
-        for (int it = 0; it < 6; ++it) {
-            const int gidx = tid + it * 96;
-            if (gidx < 512) {
-                const int row = gidx >> 3;
-                const int b   = gidx & 7;
-                const char * Vb = V_head + nb21 * (kb * KV_TILE + row);
-                const block_q4_0 * bq = (const block_q4_0 *)(Vb + b * sizeof(block_q4_0));
-                half2 * tv = tile_KV + row * S_KV + b * 16;
-                if (row < k_sup) {
-                    dequant_q4_0_h2(bq, tv);
-                } else {
-                    #pragma unroll
-                    for (int l = 0; l < 16; ++l) {
-                        tv[l] = make_half2(0.0f, 0.0f);
-                    }
+        if (tid < 128) {
+            const int row = tid >> 3;
+            const int b   = tid & 7;
+            const char * Vb = V_head + nb21 * (kb * KV_TILE + row);
+            const block_q4_0 * bq = (const block_q4_0 *)(Vb + b * sizeof(block_q4_0));
+            half2 * tv = tile_KV + row * S_KV + b * 16;
+            if (row < k_sup) {
+                dequant_q4_0_h2(bq, tv);
+            } else {
+                #pragma unroll
+                for (int l = 0; l < 16; ++l) {
+                    tv[l] = make_half2(0.0f, 0.0f);
                 }
             }
         }
@@ -296,12 +273,9 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         // 6. WMMA P x V: Accumulate into VKQ_C (FP32)
         #pragma unroll
         for (int i_v = 0; i_v < DKV; i_v += 16) {
-            #pragma unroll
-            for (int k00 = 0; k00 < 32; k00 += 8) {
-                T_A_VKQ A;
-                load_ldmatrix_trans(A, tile_KV + 2*k00*S_KV + i_v/2, S_KV);
-                mma(VKQ_C[i_v/16], A, B[k00/8]);
-            }
+            T_A_VKQ A;
+            load_ldmatrix_trans(A, tile_KV + i_v/2, S_KV);
+            mma(VKQ_C[i_v/16], A, B[0]);
         }
 
         // V reads done, next KV block can overwrite tile_KV with K
@@ -388,9 +362,9 @@ bool ggml_cuda_flash_attn_ext_prefill_d256_rdna3(
         return false;
     }
 
-    const int ntile = (ne01 + 8 - 1) / 8;
+    const int ntile = (ne01 + 16 - 1) / 16;
     const dim3 blocks(ne12 * ntile, 1, 1);
-    const dim3 threads(96, 1, 1);
+    const dim3 threads(192, 1, 1);
 
     cudaStream_t stream = ctx.stream();
 
