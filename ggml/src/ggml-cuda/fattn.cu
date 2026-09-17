@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-decode-rdna3.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-prefill-d256-rdna3.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -582,7 +583,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
-            if (!ggml_cuda_flash_attn_ext_decode_rdna3(ctx, dst)) {
+            if (!ggml_cuda_flash_attn_ext_decode_rdna3(ctx, dst) &&
+                !ggml_cuda_flash_attn_ext_prefill_d256_rdna3(ctx, dst)) {
+                fprintf(stderr, "FALLBACK_TO_TILE_TRIGGERED!\n");
                 ggml_cuda_flash_attn_ext_tile(ctx, dst);
             }
             break;
