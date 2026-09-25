@@ -103,6 +103,20 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+#if defined(GGML_USE_HIP)
+// Apply per-weight signs to 4 packed grid bytes without __vcmpne4/__vsub4.
+// vendors/hip.h implements those byte-wise; on gfx11 they scalarize into ~28 16-bit VALU ops
+// per 4 weights (v_lshlrev_b16/v_and_b16/v_sub_nc_i16/v_perm/v_cndmask...), i.e. >50% of the
+// IQ3_XXS MMVQ hot loop. All iq2/iq3 grid bytes are < 0x80 (max 62), so per byte
+// (g ^ 0xFF) + 1 == -g without any carry into the neighbouring byte: bit-exact vs the old path.
+// sign_nibble: 4 sign bits in [3:0]; bit i negates byte i.
+static __device__ __forceinline__ int iq_apply_sign4(const uint32_t grid, const uint32_t sign_nibble) {
+    const uint32_t b = __umul24(sign_nibble, 0x00204081u) & 0x01010101u; // bit i -> LSB of byte i
+    const uint32_t m = (b << 8) - b;                                     // 0xFF in negated bytes
+    return (int)((grid ^ m) + b);
+}
+#endif // defined(GGML_USE_HIP)
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -1173,6 +1187,17 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
+#if defined(GGML_USE_HIP)
+        // same value as unpack_ksigns(): low byte = 7-bit code with the 8th sign as parity
+        const uint32_t v = (aux32 >> (7*l0/2)) & 0xFFu;
+        const uint32_t s = v ^ ((__popc(v) & 1u) << 7);
+
+        const int grid_l = iq_apply_sign4(grid[l0 + 0], s & 0xFu);
+        const int grid_h = iq_apply_sign4(grid[l0 + 1], s >> 4);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+#else
         const int2 grid_pos = make_int2(grid[l0 + 0], grid[l0 + 1]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
@@ -1185,6 +1210,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+#endif // defined(GGML_USE_HIP)
 
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
@@ -1220,11 +1246,17 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
+#if defined(GGML_USE_HIP)
+        const uint32_t sp = signs_packed_8[l0/2];
+        const int grid_l = iq_apply_sign4(grid_pos.x, sp & 0xFu);
+        const int grid_h = iq_apply_sign4(grid_pos.y, sp >> 4);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif // defined(GGML_USE_HIP)
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
