@@ -50,6 +50,9 @@ Goal: attack the diagnosed latency-bound IQ3_XXS GEMV (76.7% instruction-wait st
   - Phase-4E prefetch-distance / VDR-increase / independent-accumulator variants: marginal to negative (E variants: MARGINAL, do NOT adopt; VDR=2 is optimum).
   - Phase-5: MMQ WMMA is genuine on RDNA3, but GEMM routing for MTP verify is NOT viable (+30%/+50% per-matmul cost at ne11=4-5).
   - EXP-007 (RMSNorm+Quantize+GEMV fusion): rejected at feasibility; dispatch-count reduction cannot address the 15-17 ms long-tail gap stalls (upper bound ~9% of wall < 10% threshold).
+- DONE: EXP-023 HIP sign-application fastpath (IQ3_XXS/IQ3_S `iq_apply_sign4`) - `628507055`.
+  - MEASURED (op-level, same-protocol): iq3_xxs n=1 114.28 -> 51.33 us/run (-55.1%), iq3_s n=1 113.65 -> 57.32 (-49.6%); n=512 flat. PMU: duration -56.9%, SQ_INSTS_VALU -69.9% per dispatch; VGPR type18 n=1 80 -> 48. Bit-exact (11/11 x2, greedy 3/3 byte-identical, PPL final identical).
+  - CAVEAT: full-model wall before/after not measured this run (user-reported production sample only); see PERFORMANCE.md 1.6 and T-9.
 
 ### EXPECTED / PROJECTED (no passing benchmark; each requires a full gate pass)
 

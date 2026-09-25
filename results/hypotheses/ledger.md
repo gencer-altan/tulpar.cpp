@@ -149,6 +149,32 @@ SYSTEM-LEVEL SYNTHESIS:
 VERDICT: Strongly supported. Confidence 0.9.
 
 ---
+H13: "gfx11'de byte-wise sign uygulamasinin (__vcmpne4/__vsub4) VALU emulasyon zinciri, IQ3_XXS/IQ3_S MMVQ decode kernel'inin ana maliyetidir."
+PREDICTION: Native u32x24 carpma (v_mul_u32_u24_e32) ile ikame, dispatch-basi VALU
+  talimatlarinin ve kernel surelerinin buyuk kismini kaldirir; occupanciyi bozmadan.
+EVIDENCE FOR:
+  - PMU (rocprofv3, type18 n=1, test-backend-ops perf): SQ_INSTS_VALU 21.01M ->
+    6.32M (-69.9%)/dispatch; sure 105.20 -> 45.34 us (-56.9%); GRBM_GUI_ACTIVE
+    276,607 -> 124,819 (-54.9%).
+  - Disassembly: baseline 16x v_perm_b32 + 32x v_sub_nc_i16 + v_lshlrev_b16/
+    v_cndmask_b32_e64 zinciri; patched'da v_mul_u32_u24_e32 (0x204081) + xor/add.
+  - Op-level: iq3_xxs n=1 114.28 -> 51.33 us/run (-55.1%); iq3_s n=1 113.65 ->
+    57.32 (-49.6%); n=512 flat (GEMM path etkilenmedi).
+  - VGPR: type18 n=1 80 -> 48; type21 n=1 80 -> 40 (occupancy baskisi azalmis,
+    artmamis).
+EVIDENCE AGAINST:
+  - Full-model duvar oncesi/sonrasi olculmedi (build-baseline kontamine, GPU dolu)
+    -> kernel kazanminin wall'a gecis oranini dogrulanmadi.
+  - 31.62 tok/s uretim sayisi tek basina ve kullanicinin raporu (log yok); MTP
+    durumu bilinmiyor.
+ALTERNATIVES: (a) gather chain hoist (EXP-006: +4.6% ort, restore edildi),
+  (b) LDS staging (EXP-022: -2.5%, REVERT), (c) grid tablosu repack (deferred).
+FALSIFICATION TEST: T-9 - patched build'de rocprofv3 occupancy (resident waves/SIMD)
+  + Phase-3 gate benchmark (MTP OFF, 5 rep, sabit seed, 256 tok, 1k/16k/63k ctx).
+  Occupancy dususe veya wall kazaniminin %15'in altinda kalmasi haliinde falsified.
+VERDICT: Tentative. Confidence 0.7.
+
+---
 USER'S 29.34 tok/s OBSERVATION IN CONTEXT:
 - ~6.3k prompt ile olculmus; bizim 6.9k ON bandimiz 27.9-49.8 tok/s (median ~36).
 - 29.34 bandin alt-orta kisitesi: dusuk-kabul bir dongude tipik deger. Anormal degil.

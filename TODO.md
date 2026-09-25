@@ -48,6 +48,13 @@ Active and upcoming optimization tasks for the tulpar.cpp fork. Every task lists
 - Approach: track per-experiment VRAM peaks; any variant that raises peak VRAM at 128k-131k must justify itself against the guard.
 - No projected gain; guardrail task.
 
+### T-9. EXP-023 full-model wall before/after (Phase-3 gate) + H13 occupancy falsification
+
+- Evidence: EXP-023 (sign fastpath, `628507055`) shows op-level -50%/-55% (n=1) and PMU SQ_INSTS_VALU -69.9% per dispatch, but full-model wall before/after is missing (build-baseline contaminated: mmvq.cu.o byte-identical to build-patched; GPU occupied by a running production server).
+- Approach: (1) restore clean vecdotq.cuh and incrementally rebuild build-baseline; (2) Phase-3 gate benchmark (MTP OFF, 5 reps, fixed seed, 256 toks, 1k/16k/63k ctx) on baseline and patched; (3) rocprofv3 occupancy check (resident waves/SIMD) on the patched build as the H13 falsification test; (4) restore the patch and record the EXP-023 follow-up numbers.
+- Gate: fresh process per arm, >= 3 reps, spread < 1%, correctness gates PASS. If the wall gain is below the 15% threshold or occupancy regresses, H13 is falsified and the change is revisited.
+- PROJECTED: unknown until measured.
+
 ## Later (deferred)
 
 ### T-8. Weight-layout repack (swizzle) for contiguous grid indices

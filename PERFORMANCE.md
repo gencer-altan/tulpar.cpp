@@ -129,6 +129,39 @@ Target: 40 tok/s decode. Gap computed as `(target - current) / current * 100` fr
 
 Historical record (Phase-1B era, V3 model, from `experiments/phase2a/evidence_ledger.md`): +81% @1k, +96% @16k, +154% @63k, +234% @128k.
 
+### 1.6 EXP-023: HIP sign-application fastpath for IQ3_XXS/IQ3_S (commit `628507055`)
+
+Change: `iq_apply_sign4()` (HIP-only, `ggml/src/ggml-cuda/vecdotq.cuh`) replaces the scalarized `__vcmpne4`/`__vsub4` byte-wise sign chain in `vec_dot_iq3_xxs_q8_1` and `vec_dot_iq3_s_q8_1` with a native `v_mul_u32_u24_e32` + xor/add. Bit-exact; non-HIP (CUDA) path unchanged.
+
+Op-level (MEASURED, test-backend-ops perf, m=4096 k=14336, same workload both sides):
+
+| quant   | n    | baseline us/run | patched us/run | delta   |
+|---------|------|----------------:|----------------:|---------|
+| iq3_xxs |    1 |           114.28 |            51.33 | -55.1%  |
+| iq3_xxs |    2 |           121.89 |            64.96 | -46.7%  |
+| iq3_xxs |    3 |           130.77 |            79.57 | -39.2%  |
+| iq3_xxs |    4 |           141.78 |            90.34 | -36.3%  |
+| iq3_xxs |    5 |           153.28 |           100.83 | -34.2%  |
+| iq3_xxs |    8 |           199.40 |           138.92 | -30.3%  |
+| iq3_xxs |  512 |          2380.69 |          2382.77 | +0.1% (GEMM, flat) |
+| iq3_s   |    1 |           113.65 |            57.32 | -49.6%  |
+| iq3_s   |    2 |           120.74 |            70.05 | -42.0%  |
+| iq3_s   |    3 |           128.02 |            80.82 | -36.9%  |
+| iq3_s   |    4 |           138.55 |            89.31 | -35.5%  |
+| iq3_s   |    5 |           149.66 |           102.53 | -31.5%  |
+| iq3_s   |    8 |           221.26 |           147.83 | -33.2%  |
+| iq3_s   |  512 |          2419.66 |          2417.26 | -0.1% (GEMM, flat) |
+
+Per-dispatch HW counters (rocprofv3 PMU, `mul_mat_vec_q<(ggml_type)18, 1, ...>`): duration 105.20 -> 45.34 us (-56.9%), SQ_INSTS_VALU 21.01M -> 6.32M (-69.9%), GRBM_GUI_ACTIVE 276,607 -> 124,819 (-54.9%).
+
+Kernel resources (same trace): VGPR type18 n=1 80 -> 48, type21 n=1 80 -> 40; all type18/type21 instantiations reduced; type29 unchanged. SGPR 128, LDS 0, scratch 0 (both builds).
+
+Classification: MEASURED (op-level, same protocol). The full-model wall before/after (Phase-3 gate: MTP OFF, 5 reps, fixed seed, 256 toks) was NOT measured this run: build-baseline was rebuilt against the patched tree (contaminated) and the GPU is occupied by a running production server. Tracked as T-9.
+
+Production single sample (USER-REPORTED, no surviving log, NOT a before/after pair): 31.62 tok/s decode (2972.53 ms), prefill 441.41 tok/s, ctx ~1330-1425, V2 model, patched build. MTP state of the run unknown.
+
+Reference numbers (USER-REPORTED, NOT measured in this commit): stock kernel ~18 tok/s; user's own decode kernel ~22 tok/s; Vulkan ~31-33 tok/s (1k ctx, MTP off).
+
 ---
 
 ## 2. ATTRIBUTION (measurement-only)

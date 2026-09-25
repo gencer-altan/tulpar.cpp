@@ -1040,3 +1040,100 @@ CAVEAT
 
 VERDICT
 REVERT. BW -2.5% (NOT +15%), tg flat (NOT +5%). Decision rule (BW >= +15% AND tg >= +5%) fails. GEMV inner-loop micro-tuning is PERMANENTLY CLOSED. Working tree reverted to `1bbd07215`.
+
+
+## EXP-023: HIP sign-application fastpath for IQ3_XXS/IQ3_S (iq_apply_sign4)
+
+PROBLEM
+On gfx11 (RX 7800 XT, RDNA3) the byte-wise sign application of the IQ3_XXS/IQ3_S
+MMVQ decode kernels (`__vcmpne4` + `__vsub4`, byte-wise impl in vendors/hip.h)
+scalarizes into a long 16-bit VALU chain (v_lshlrev_b16/v_and_b16/v_sub_nc_i16/
+v_perm_b32/v_cndmask_b32_e64), ~28 16-bit ops per 4 weights, a large share of
+the MMVQ hot loop. This is a distinct cost center from the gather latency that
+EXP-022 closed: it is ALU work, not a load. The decode GEMV (type 18) is the
+dominant decode kernel (71.5-74.1% of decode kernel time, EXP-005/EXP-021).
+
+EVIDENCE
+- Disassembly (baseline `mul_mat_vec_q<type18, n=2>`): 16x v_perm_b32 + 32x
+  v_sub_nc_i16 plus a v_lshlrev_b16/v_cndmask_b32_e64/v_and_b16 sign chain per
+  sign application; the patched build replaces the chain with
+  `v_mul_u32_u24_e32` (immediate 0x204081) + xor/add.
+- Per-dispatch HW counters (rocprofv3 PMU, `mul_mat_vec_q<(ggml_type)18, 1, ...>`,
+  test-backend-ops perf n=1): SQ_INSTS_VALU 21.01M -> 6.32M (-69.9%),
+  GRBM_GUI_ACTIVE 276,607 -> 124,819 (-54.9%), duration 105.20 us -> 45.34 us
+  (-56.9%).
+- Kernel resources (same trace): VGPR type18 n=1 80 -> 48, type21 n=1 80 -> 40;
+  all type18/type21 instantiations reduced; type29 (IQ1_M) unchanged; SGPR 128,
+  LDS 0, scratch 0 unchanged.
+- Op-level (test-backend-ops perf, m=4096 k=14336): iq3_xxs n=1 114.28 -> 51.33
+  us/run (-55.1%), iq3_s n=1 113.65 -> 57.32 (-49.6%); n=512 flat (GEMM path).
+
+CHANGE
+- ggml/src/ggml-cuda/vecdotq.cuh (commit 628507055):
+  - New `iq_apply_sign4(grid, sign_nibble)` under `#if defined(GGML_USE_HIP)`:
+    per byte (g ^ 0xFF) + 1 == -g (two's-complement negate, no carry into the
+    neighbouring byte since grid bytes < 0x80); sign bits expanded with
+    `__umul24(sign_nibble, 0x00204081u)`.
+  - `vec_dot_iq3_xxs_q8_1`: apply signs to the raw grid byte pair (signs from
+    aux32, same value as `unpack_ksigns`).
+  - `vec_dot_iq3_s_q8_1`: apply signs to the dequantized grid byte pair (signs
+    from `signs_packed_8`, same mapping as the old __vcmpne4 pair).
+  - Non-HIP (CUDA) path unchanged.
+
+RESULT
+Correctness gates (PASS, patched build, ROCm0 gfx1101):
+- test-backend-ops -o MUL_MAT -t iq3_xxs: 11/11 PASS
+- test-backend-ops -o MUL_MAT -t iq3_s: 11/11 PASS
+- Deterministic greedy A/B (same prompt/seed, fresh server per arm,
+  short/mid/long): output byte-identical (cmp) on all 3 cases
+  (1027/1024/783 B).
+- perplexity (wikitext-2, 20 chunks): final estimate identical (7.3775 +/-
+  0.25946); surviving per-chunk lines identical.
+
+Op-level decode shape (m=4096, k=14336, test-backend-ops perf, same protocol
+both sides):
+
+| quant   | n    | baseline us/run | patched us/run | delta   |
+|---------|------|----------------:|----------------:|---------|
+| iq3_xxs |    1 |           114.28 |            51.33 | -55.1%  |
+| iq3_xxs |    2 |           121.89 |            64.96 | -46.7%  |
+| iq3_xxs |    3 |           130.77 |            79.57 | -39.2%  |
+| iq3_xxs |    4 |           141.78 |            90.34 | -36.3%  |
+| iq3_xxs |    5 |           153.28 |           100.83 | -34.2%  |
+| iq3_xxs |    8 |           199.40 |           138.92 | -30.3%  |
+| iq3_xxs |  512 |          2380.69 |          2382.77 | +0.1% (GEMM, flat) |
+| iq3_s   |    1 |           113.65 |            57.32 | -49.6%  |
+| iq3_s   |    2 |           120.74 |            70.05 | -42.0%  |
+| iq3_s   |    3 |           128.02 |            80.82 | -36.9%  |
+| iq3_s   |    4 |           138.55 |            89.31 | -35.5%  |
+| iq3_s   |    5 |           149.66 |           102.53 | -31.5%  |
+| iq3_s   |    8 |           221.26 |           147.83 | -33.2%  |
+| iq3_s   |  512 |          2419.66 |          2417.26 | -0.1% (GEMM, flat) |
+
+Per-dispatch (type18 n=1, rocprofv3 PMU):
+- duration 105.20 -> 45.34 us (-56.9%)
+- SQ_INSTS_VALU 21.01M -> 6.32M (-69.9%)
+- GRBM_GUI_ACTIVE 276,607 -> 124,819 (-54.9%)
+
+Production single sample (USER-REPORTED, no surviving log): 31.62 tok/s decode
+(2972.53 ms), prefill 441.41 tok/s, ctx ~1330-1425, V2 model, this build. MTP
+state of that run unknown. Not a before/after measurement.
+
+Reference numbers (USER-REPORTED, NOT measured in this commit): stock kernel
+~18 tok/s; user's own decode kernel ~22 tok/s; Vulkan ~31-33 tok/s (1k ctx, MTP
+off).
+
+CAVEAT
+- Full-model wall before/after (Phase-3 gate: MTP OFF, 5 reps, fixed seed,
+  256 toks) NOT run: build-baseline was rebuilt against the patched tree (its
+  mmvq.cu.o is byte-identical to build-patched) and the GPU is occupied by a
+  running production server. Tracked as T-9.
+- The 31.62 tok/s sample is a single user-reported production number without a
+  surviving log; MTP state unknown. Not averaged with anything.
+- Op-level numbers are from test-backend-ops (isolated op), not full-model wall.
+- gfx1101 only; other architectures use the unchanged non-HIP path.
+
+VERDICT
+ADOPT: bit-exact, all correctness gates PASS, op-level decode shape -50% to
+-55%, PMU confirms the VALU-chain removal is the mechanism. Full-model wall
+before/after pending (T-9); production gain is user-reported only.
