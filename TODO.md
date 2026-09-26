@@ -55,6 +55,13 @@ Active and upcoming optimization tasks for the tulpar.cpp fork. Every task lists
 - Gate: fresh process per arm, >= 3 reps, spread < 1%, correctness gates PASS. If the wall gain is below the 15% threshold or occupancy regresses, H13 is falsified and the change is revisited.
 - PROJECTED: unknown until measured.
 
+### T-10. Fix fattn-prefill-d256-rdna3 hard assert crashing MTP draft context at load
+
+- Evidence (phase-6, 2026-09-26): production restore per manifest (build-p3 + `--spec-type draft-mtp`) aborts at load: `fattn-prefill-d256-rdna3.cu:392: GGML_ASSERT(K->type == GGML_TYPE_Q4_0) failed`, reached via `common_context_can_seq_rm(ctx_dft)` (server-context.cpp:1194) probing the MTP draft context with a 2-token decode. Reproduced on build-p3, build-patched, and build/bin (segfault). MTP OFF loads and runs cleanly on all current builds. Regression window: fattn-rdna3 Phase 1-3 (`bc474fe7d`, `72431fd53`, `f3f27aa41`, 2026-09-17); last successful MTP production run 2026-08-26. Production currently runs MTP OFF on build-patched as a documented deviation.
+- Approach: in the `ggml_cuda_flash_attn_ext_prefill_d256_rdna3` entry check, turn the K/V `GGML_ASSERT(type == Q4_0)` pair (and the `nb[0]` stride asserts) into capability `return false` so the fattn.cu:587 dispatcher falls back to the TILE kernel for non-q4_0 KV (the MTP draft context). Full correctness gates + an MTP-ON load test + draft-acceptance check required.
+- Gate: MTP-ON server loads and generates with q4_0 target KV; greedy A/B on target outputs unchanged vs TILE path on a small ctx; production restorable per manifest verbatim.
+- PROJECTED: restores the documented production config (MTP ON); no decode-path perf change expected on q4_0 KV (assert only ever fires on the draft context path).
+
 ## Later (deferred)
 
 ### T-8. Weight-layout repack (swizzle) for contiguous grid indices
@@ -64,6 +71,7 @@ Active and upcoming optimization tasks for the tulpar.cpp fork. Every task lists
 
 ## Done (reference)
 
+- EXP-025 GQA<6> head batching for decode attention (default ON, opt-out `GGML_FA_DECODE_GQA_BATCH_OFF=1`) - `3165bee7e` (MEASURED 15.30 -> 19.59 t/s @131k, FA decode 37.3 -> 22.13 ms/tok).
 - Tile FA for quantized KV decode @hsk 256 - `66dcba5eb` (MEASURED +39.5% @63k).
 - PATH A fused q4_0 KV staging elimination - `2e033a696` (MEASURED +28.79% @128k).
 - EXP-006 gather hoist restored - `f7c4436c3`, `068f581e2` (MEASURED +12.97% @63k; see T-6 for the record conflict).

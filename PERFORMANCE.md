@@ -162,6 +162,32 @@ Production single sample (USER-REPORTED, no surviving log, NOT a before/after pa
 
 Reference numbers (USER-REPORTED, NOT measured in this commit): stock kernel ~18 tok/s; user's own decode kernel ~22 tok/s; Vulkan ~31-33 tok/s (1k ctx, MTP off).
 
+### 1.7 EXP-025: GQA<6> head batching for decode attention (commit `3165bee7e`)
+
+Change: `flash_attn_decode_rdna3_gqa<6>` (`ggml/src/ggml-cuda/fattn-decode-rdna3.cu`). One block per (kv_head, split) processes all 6 query heads of the kv head; K/V Q4_0 tiles are dequantized once per tile and reused across heads. At 131k KV: grid (4, 60) instead of (24, 10) - same 240 blocks (same wavefront parallelism), 1/6 KV DRAM traffic. Default decode path on gfx1101 for gqa_ratio == 6; opt out with `GGML_FA_DECODE_GQA_BATCH_OFF=1`.
+
+Wall (llama-bench, Qwen3.8-27B-UD-Q2_K_XL, -ngl 999, -ctk q4_0 -ctv q4_0, -p 0 -d 131072 -n 512 -b 512 -r 1, llama-server up in every arm):
+
+| arm | t/s |
+|-----|----:|
+| old kernel, (24, 10) grid | 15.30 |
+| GQA, naive (4, 10) grid, rejected intermediate | 11.26 |
+| GQA, (4, 60) grid | 19.59 |
+
+Kernel-level (rocprofv3 --kernel-trace --stats, 131072 KV, 8208 fa-decode dispatches = 513 passes x 16 layers):
+
+| kernel | old (phase-6 P-128k @129424) | GQA |
+|--------|----------------------------:|----:|
+| fa-decode avg us/call | 2157.2 | 1380.4 |
+| fa-decode ms/tok | 36.84 (~37.3 @131072) | 22.13 |
+| combine<256> us/call | 3.11 | 5.56 |
+| combine<256> ms/tok | ~0.05 | 0.089 |
+| mul_mat_vec_q total ms/tok | 20.53 | 21.22 |
+
+Kernel resources (amdgcn asm): gqa<6> 118 VGPR, ScratchSize 0 (old: 81 VGPR, scratch 0); combine<256> 55 VGPR, scratch 0.
+
+Classification: MEASURED (+28% @131k, single-rep arms; old-kernel arm measured twice, spread 0.3%). Correctness: fattn_decode_rdna3_boundary kv=11/129424 within CPU tolerance (~1.1e-3 / ~6e-6); per-head partials bit-identical to the old kernel, end-to-end bit-exactness vs old kernel no longer holds (n_splits 10 -> 60 changes the split fold order). FA decode is still the #1 decode term at 128k.
+
 ---
 
 ## 2. ATTRIBUTION (measurement-only)

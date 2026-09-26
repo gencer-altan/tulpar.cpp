@@ -1137,3 +1137,57 @@ VERDICT
 ADOPT: bit-exact, all correctness gates PASS, op-level decode shape -50% to
 -55%, PMU confirms the VALU-chain removal is the mechanism. Full-model wall
 before/after pending (T-9); production gain is user-reported only.
+
+## EXP-024: max_splits sweep (240/384/480/768) rejected
+
+PROBLEM
+Test whether raising max_splits (n_splits at 131k decode: 10 -> 16/20/32) gives a measured decode gain at 128k/1k context, per the "keep only measured gain" rule. EXP-015 measured ~38% occupancy at grid (6144,10); hypothesis was that more split waves raise occupancy.
+
+EVIDENCE
+Bench: llama-server build-patched, Qwen3.8-27B-UD-Q2_K_XL, -ctk q4_0 -ctv q4_0, port 8080, production server stopped. Greedy (temp 0, top_k 1, seed 1234), 256 predicted tokens, rep1 fresh + rep2 cached.
+- G1 (test-backend-ops FLASH_ATTN_EXT nr23=[6,1] nb=1 mask=0): 3/3 OK for all 4 values (kv 1024/8192/65536).
+- 128k decode tok/s (rep1/rep2): V240=15.39/15.39, V384=13.93/13.92, V480=14.77/14.76, V768=14.15/14.09. Every value regresses -4.1% to -9.6% vs V240.
+- 1k decode tok/s (rep2): V240=34.90, V384=35.18, V480=35.21, V768=35.58. +1.0% to +2.0%, non-monotonic in n_splits, within noise.
+- Kernel trace at 128k (496 fa-decode dispatches per value, 16 layers x 31 steps, median per call): V240=2259.5us, V384=2676.7us, V480=2265.5us (p90 3130.7), V768=2633.1us. combine: 3.12 to 4.04us, negligible. The fa-decode delta exactly accounts for the end-to-end tok/s regression.
+- PMC (V240, 286 dispatches with counter data): occupancy median 40.23% (waves/SIMD = SQ_WAVE_CYCLES/(GRBM_GUI_ACTIVE x 240), /16 x 100). SQ_WAIT_INST_ANY median 469.9M > SQ_INSTS_VALU median 347.6M: the kernel waits on memory more than it computes. It is memory-wait bound, not occupancy bound.
+- Greedy diff (rep1 text vs V240): 128k all MATCH. 1k: V480 and V768 diverge from V240/V384 at char 424 (token ~106, the first step where n_splits=17; V384 caps at 16).
+- Isolation: fattn_decode_rdna3_boundary (d256, 24 heads, 4 kv heads, Q4_0, kv 955/1024/1025/1061/1152/1153/1211, seeds 42 and 7, plain and model-view layouts): GPU-vs-CPU max abs diff flat at ~1e-4 for n_splits 10 and 15-19. The kernel is numerically correct at 15-19. The 1k greedy divergence is ulp noise flipping argmax inside the degenerate "and dog" repetition, not a math error.
+
+CHANGE
+None kept. Source reverted to max_splits = 240 and build-patched rebuilt; ggml/src/ggml-cuda/fattn-decode-rdna3.cu is unchanged (git clean).
+
+RESULT
+No measurable gain. All sweep values regress at 128k (-4.1% to -9.6%) and at best tie at 1k (+1% to +2%, noise, non-monotonic). PMC shows the decode kernel is memory-wait bound at ~40% occupancy; adding split waves only adds memory-wait pressure on the same Q4_0 KV path.
+
+CAVEAT
+- 1k greedy divergence (V480/V768) is cosmetic: tie-flip from ulp-level addition-order differences in a degenerate repetition. Correctness proven by G1 plus the isolated kernel dumps.
+- 1k deltas are single-rep per value (rep1/rep2 agree within 0.5%) and within run-to-run noise.
+- Traced/pmc arms needed SIGKILL escalation at stop (rocprofv3 intercept blocks graceful shutdown); flush completed, trace CSVs complete (496 dispatches per arm).
+
+VERDICT
+REJECTED. Keep max_splits = 240. The occupancy headroom is not the bottleneck; the memory-wait counter says the next knob must cut KV traffic (KNOB 3: GQA head batching, the 6x KV multiplier) instead of adding parallelism.
+
+## EXP-025: KNOB 3 (GQA<6> head batching) adopted as default decode path
+
+PROBLEM
+EXP-024 verdict: the decode kernel is memory-wait bound (~40% occupancy, SQ_WAIT_INST_ANY > SQ_INSTS_VALU); the next knob must cut KV traffic. KNOB 3: GQA head batching. Qwen3.8-27B has gqa_ratio = 6 (24 q heads over 4 kv heads), so the old kernel reads the same Q4_0 K/V tiles 6 times (once per q head) per token. Batch the 6 q heads of a kv head into one block: K/V tiles are loaded and dequantized once per tile and reused across the heads, 6x less KV DRAM traffic.
+
+EVIDENCE
+- Correctness (fattn_decode_rdna3_boundary, d256, 24 heads, 4 kv heads, Q4_0): kv=11 max_abs ~1.1e-3 (default-ON recheck ~7e-4), kv=129424 max_abs ~6e-6. Within CPU tolerance. Per-head partials are bit-identical to the old kernel; bit-exactness vs the old kernel no longer holds end-to-end because n_splits 10 -> 60 changes the split fold order (both sides within CPU tolerance).
+- Live A/B (llama-bench, Qwen3.8-27B-UD-Q2_K_XL, -ngl 999 -ctk q4_0 -ctv q4_0 -p 0 -d 131072 -n 512 -b 512 -r 1, llama-server up in every arm): old kernel 15.34 -> 15.30 t/s (two runs); GQA with the naive n_splits = 240/24 = 10 (40 blocks): 11.26 t/s, REJECTED intermediate (parallelism collapse: 6x fewer wavefronts, 6x per-thread LDS/FMA, latency-bound); GQA with max_splits = 240/n_kv_heads = 60 (4 kv heads x 60 splits = 240 blocks, same wavefront parallelism as the old kernel): 19.59 t/s = +28%.
+- Kernel trace (rocprofv3 --kernel-trace --stats, traced 18.52 t/s, overhead 5.5% < 25% gate; 131072 KV, 513 passes x 16 layers = 8208 fa-decode dispatches): gqa<6> avg 1380.4 us/call = 22.13 ms/tok vs old kernel 2157.2 us/call = 36.84 ms/tok (phase-6 P-128k @ 129424 KV, ~37.3 @131072) = 1.69x (-41%). combine<256> 3.11 -> 5.56 us/call, 0.089 ms/tok (negligible, not bloated by 60 splits). mul_mat_vec_q total 20.53 -> 21.22 ms/tok (unchanged, context-invariant).
+- Resources (amdgcn asm): gqa<6> 118 VGPR, ScratchSize 0 (no scratch spills); old kernel 81 VGPR, scratch 0; combine<256> 55 VGPR, scratch 0.
+
+CHANGE
+Added flash_attn_decode_rdna3_gqa<6> to ggml/src/ggml-cuda/fattn-decode-rdna3.cu: grid (n_kv_heads, n_splits), block (256,1); per-head arithmetic identical to flash_attn_decode_rdna3 (dequant k0..k3/v0..v3 once per tile, same FMA chains, warp-0 softmax tree, m_shared/lsum_shared/r_shared per head). Dispatcher: use_gqa = !GGML_FA_DECODE_GQA_BATCH_OFF && gqa_ratio == 6 (default ON); max_splits = 240 / (use_gqa ? n_kv_heads : n_heads) so GQA keeps 240 blocks. Combine launch unchanged (partials indexed head * n_splits + split, head = kv_head * 6 + h).
+
+RESULT
+ADOPTED. Default decode path on gfx1101 for gqa_ratio == 6. 15.30 -> 19.59 t/s @131k (-d 131072, +28%). FA decode 37.3 -> 22.13 ms/tok (-41%); FA is still the #1 decode term at 128k (~43% of wall).
+
+CAVEAT
+- Single-rep arms (-r 1); the old-kernel arm was measured twice and agrees within 0.3%.
+- 19.59 is below the EXP-024-era 23.88 t/s baseline: different methodology (llama-bench -d 131072 vs -p 131072 -n 512), not a regression. A/B within the same command is valid.
+- Production config MTP OFF (see T-10); llama-server was up during all arms, same condition on both sides.
+
+VERDICT
+ADOPTED (default ON, opt-out GGML_FA_DECODE_GQA_BATCH_OFF=1). FA decode is now ~2x off the old DRAM cost but still the largest decode term; next knob must attack the residual latency (118 VGPR = 4 waves/SIMD) or the GEMV term (21.22 ms/tok).
