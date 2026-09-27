@@ -1191,3 +1191,34 @@ CAVEAT
 
 VERDICT
 ADOPTED (default ON, opt-out GGML_FA_DECODE_GQA_BATCH_OFF=1). FA decode is now ~2x off the old DRAM cost but still the largest decode term; next knob must attack the residual latency (118 VGPR = 4 waves/SIMD) or the GEMV term (21.22 ms/tok).
+
+## EXP-026: GQA decode exp2f softmax + 480-block split budget adopted
+
+PROBLEM
+Continue the GQA<6> decode cost-down from EXP-025 (1380 us/call, 19.59 t/s @128k). Two knobs this round: (1) expf -> exp2f(x*LOG2E) with -fgpu-flush-denormals-to-zero scoped to fattn-decode-rdna3.cu, lowering to bare v_exp_f32 (2178 -> 2010 VALU, -7.7%); (2) hypothesis: at 240 blocks (60 splits x 4 kv heads) each CU demands 4 blocks but VGPR (120 -> 4 waves/SIMD) allows only 2 resident; a deeper queue of shorter blocks should rotate work in sooner and overlap barrier/memory waits.
+
+EVIDENCE
+- Correctness (fattn_decode_rdna3_boundary, Q4_0 KV, d256, 24 heads / 4 kv heads): nmse 1.557e-06 @kv=11, 1.511e-06 @kv=129424 (gate 1e-4), identical for exp2f and 120-split builds. Contexts under 3840 tokens are bit-unaffected: n_splits = ceil(ne11/64) stays under 60 either way.
+- Same-day rocprof A/B (rocprofv3 --kernel-trace --stats -f rocpd, llama-bench -p 0 -d 131072 -n 512 -b 512 -r 1, server down, 8192 real gqa dispatches per arm, quartiles stable):
+  - B expf @60 splits: gqa<6> 1370.0 us/call; traced 18.86 t/s
+  - A exp2f @60 splits: gqa<6> 1344.6 us/call (-1.9% vs expf); traced 18.84 t/s; untraced 20.07 t/s
+  - C exp2f @120 splits: gqa<6> 1080.7 us/call (-19.6% vs A, -21.1% vs B; quartiles 1079.6-1082.3); traced 20.43 t/s; untraced 22.01 t/s
+  - combine<256>: 5.5 -> 5.4 -> 8.4 us/call (120 splits cost +3.0 us x 16 layers = 0.05 ms/tok, negligible)
+  - Wall accounting: FA decode 21.51 -> 17.29 ms/tok (-4.22) matches wall 49.83 -> 45.44 ms/tok (-4.39); non-FA kernels unchanged (prefill 161.4 -> 160.7 s, iq3_xxs 155.1 -> 154.7 s, gemv 6.39 -> 6.42 s)
+- Resources: gqa<6> asm 118 VGPR, scratch 0 in every variant (runtime reports 120 after allocation granularity). Grid check: rocpd grid_size columns are in threads (1024 = 4 blocks x 256 threads); the real launch is 4 kv heads x 120 splits = 480 blocks, was 240.
+
+CHANGE
+- commit 63503d91f: exp2f in the gqa softmax (3 call sites) + per-file -fgpu-flush-denormals-to-zero in ggml/src/ggml-hip/CMakeLists.txt.
+- commit e56075d0d: one line, max_splits = (use_gqa ? 480 : 240) / (use_gqa ? n_kv_heads : n_heads); non-GQA path unchanged.
+
+RESULT
+ADOPTED. Cumulative vs the EXP-025 baseline: 19.59 -> 22.01 t/s @128k decode (+12.4%); gqa<6> 1380.4 -> 1080.7 us/call (-21.7%); FA decode term 22.13 -> 17.29 ms/tok. Gap to the 1000 us/call objective: 8.1%.
+
+CAVEAT
+- Single-rep arms (-r 1); the +9.7% untraced wall gain is corroborated by the traced arm (+8.4%) and the 8192-dispatch kernel dbs.
+- Resident waves/SIMD stay VGPR-capped at 4 (2 blocks/CU) in both configs; the win comes from finer split granularity and faster block rotation, not from higher occupancy. Pre-measurement reasoning did not predict the size of the win.
+- EXP-024's old-kernel sweep (V480 = 20 splits x 24 heads) does not transfer: different kernel, different split granularity, 6x KV traffic delta.
+- The exp2f gain (-1.9% kernel) is small; the asm-level VALU saving (-7.7%) confirms the kernel is memory-wait bound, not VALU bound.
+
+VERDICT
+ADOPTED (default, no opt-out needed; contexts under 3840 tokens unchanged). Next: inline-asm K/V prefetch (loads at tile head, s_waitcnt vmcnt deferred to the compute tail) on the 480-block config to attack the residual memory wait; target 1080.7 -> 1000 us/call.
