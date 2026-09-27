@@ -216,6 +216,9 @@ static __global__ void flash_attn_decode_rdna3_gqa(
     constexpr int N_WARPS = D / 32;
     constexpr int S_LDSS  = 65;
     constexpr float S_OOB = -1e30f;
+    // This file is compiled with -fgpu-flush-denormals-to-zero, so exp2f
+    // lowers to bare v_exp_f32 (3 ops) instead of the expf polynomial.
+    constexpr float LOG2E = 1.4426950408889634f;
 
     __shared__ float S_lds[NH][N_WARPS*S_LDSS];
     __shared__ float P_lds[NH][TILE];
@@ -337,8 +340,8 @@ static __global__ void flash_attn_decode_rdna3_gqa(
                 const float m_old = m_shared[h];
                 __syncwarp();
                 const float m_new = fmaxf(m_old, mx);
-                const float e0 = expf(s0_ - m_new);
-                const float e1 = expf(s1_ - m_new);
+                const float e0 = exp2f((s0_ - m_new) * LOG2E);
+                const float e1 = exp2f((s1_ - m_new) * LOG2E);
                 float sum = e0 + e1;
                 sum += __shfl_down(sum, 16, 32);
                 sum += __shfl_down(sum, 8, 32);
@@ -347,7 +350,7 @@ static __global__ void flash_attn_decode_rdna3_gqa(
                 sum += __shfl_down(sum, 1, 32);
 
                 if (lane == 0) {
-                    const float r = expf(m_old - m_new);
+                    const float r = exp2f((m_old - m_new) * LOG2E);
                     lsum_shared[h] = lsum_shared[h]*r + sum;
                     m_shared[h]    = m_new;
                     r_shared[h]    = r;

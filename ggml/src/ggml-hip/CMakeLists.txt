@@ -82,6 +82,10 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
 endif()
 
+# exp2f in the decode kernel lowers to bare v_exp_f32 only with FTZ
+set_source_files_properties("../ggml-cuda/fattn-decode-rdna3.cu"
+                            PROPERTIES COMPILE_FLAGS "-fgpu-flush-denormals-to-zero")
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
