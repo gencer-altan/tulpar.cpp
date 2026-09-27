@@ -188,6 +188,23 @@ Kernel resources (amdgcn asm): gqa<6> 118 VGPR, ScratchSize 0 (old: 81 VGPR, scr
 
 Classification: MEASURED (+28% @131k, single-rep arms; old-kernel arm measured twice, spread 0.3%). Correctness: fattn_decode_rdna3_boundary kv=11/129424 within CPU tolerance (~1.1e-3 / ~6e-6); per-head partials bit-identical to the old kernel, end-to-end bit-exactness vs old kernel no longer holds (n_splits 10 -> 60 changes the split fold order). FA decode is still the #1 decode term at 128k.
 
+### 1.8 EXP-027: 6-way parallel softmax in GQA<6> decode
+
+Change: softmax phase of `flash_attn_decode_rdna3_gqa<6>` (`ggml/src/ggml-cuda/fattn-decode-rdna3.cu`) distributes the per-head reduction across warps (warp w handles head w, warps 6-7 idle) instead of warp 0 running all 6 heads serially.
+
+Wall (llama-bench, V2 model, -ngl 999, -ctk q4_0 -ctv q4_0, -p 0 -d 131072 -n 512 -b 512 -r 1, server down):
+
+| arm | t/s |
+|-----|----:|
+| EXP-026 baseline (warp-0 serial softmax) | 22.01 |
+| 6-way parallel softmax | 22.34 |
+
++0.33 t/s (+1.5%). Per-dispatch ~42 us/call saved (user-reported, ~1080.7 -> ~1039 us/call).
+
+Kernel resources (amdgcn asm): gqa<6> 118 -> 120 VGPR, scratch 0, LDS 14100 -> 14104 B.
+
+Classification: MEASURED (wall before/after, single-rep arm). Correctness: fattn_decode_rdna3_boundary kv=11/129424 nmse 1.557e-06 / 1.511e-06, identical to EXP-026 (per-head math unchanged).
+
 ---
 
 ## 2. ATTRIBUTION (measurement-only)

@@ -1222,3 +1222,30 @@ CAVEAT
 
 VERDICT
 ADOPTED (default, no opt-out needed; contexts under 3840 tokens unchanged). Next: inline-asm K/V prefetch (loads at tile head, s_waitcnt vmcnt deferred to the compute tail) on the 480-block config to attack the residual memory wait; target 1080.7 -> 1000 us/call.
+
+## EXP-027: 6-way parallel softmax across warps in GQA<6> decode
+
+PROBLEM
+In flash_attn_decode_rdna3_gqa<6>, the per-tile online softmax (max, exp2f, rowsum, P_lds, m/lsum/r update) ran serially on warp 0 over all 6 heads; warps 1-7 idle until the barrier.
+
+HYPOTHESIS
+Distribute the head reductions across warps (warp w handles head w, warps 6-7 idle) to parallelize the softmax phase 6x. Per-head shared state (S_lds[h], P_lds[h], m_shared[h], lsum_shared[h], r_shared[h]) means no cross-warp dependency; the existing __syncthreads after the phase covers publication to the V phase.
+
+EVIDENCE
+- Correctness (fattn_decode_rdna3_boundary, Q4_0 KV, d256, 24 heads / 4 kv heads): nmse 1.557e-06 @kv=11, 1.511e-06 @kv=129424 (gate 1e-4), identical to the EXP-026 values (per-head math unchanged, only the executing warp changed).
+- Resources (amdgcn gfx1101 asm, rebuilt build-p3): gqa<6> 118 -> 120 VGPR, scratch 0 (unchanged), LDS 14100 -> 14104 B. Runtime allocation granularity reports 120 in both builds, so resident waves/SIMD unchanged.
+- Wall (llama-bench -m V2 -ngl 999 -ctk q4_0 -ctv q4_0 -p 0 -d 131072 -n 512 -b 512 -r 1, server down): EXP-026 baseline 22.01 -> 22.34 t/s (+0.33, +1.5%).
+- Per dispatch (user-reported): ~42 us/call saved, ~1080.7 -> ~1039 us/call.
+- Negative resource result (same session): uncommitted q_shared variant (stage the scaled Q heads in LDS, volatile LDS reload in the KQ loop) measured 142 VGPR alone, 166 VGPR combined with this refactor; broke the <=120 VGPR gate. Bit-exact numerically; reverted by user decision before commit.
+
+CHANGE
+- Single hunk in ggml/src/ggml-cuda/fattn-decode-rdna3.cu, softmax phase: `if (warp == 0) { for (h...) }` -> `if (warp < NH) { const int h = warp; ... }`. Warps 0-5 each reduce their own head; warps 6-7 skip to the existing __syncthreads. No new LDS, no new kernel args.
+
+RESULT
+ADOPTED. 22.01 -> 22.34 t/s @131k (+1.5%); gqa<6> ~1080.7 -> ~1039 us/call (user-reported). Cumulative since EXP-025: 19.59 -> 22.34 t/s (+13.9%).
+
+CAVEAT
+- Single-rep arm (-r 1), same protocol as EXP-025/026. Per-dispatch us/call is user-reported, no surviving in-tree rocprof db.
+
+VERDICT
+ADOPTED (default). Next: carry the EXP-026 next-step (inline-asm K/V prefetch, loads at tile head, s_waitcnt vmcnt deferred to the compute tail) against the new ~1039 us/call; the 1000 us/call objective is now ~4% away.

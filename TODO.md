@@ -64,6 +64,12 @@ Active and upcoming optimization tasks for the tulpar.cpp fork. Every task lists
 
 ## Later (deferred)
 
+### T-11. Q-to-LDS staging (q_shared) in GQA<6> decode
+
+- Evidence (EXP-027 session): uncommitted q_shared variant (stage the scaled Q heads in LDS, volatile LDS reload in the KQ loop) measured 142 VGPR alone, 166 VGPR combined with the 6-way parallel softmax; broke the <=120 VGPR gate. Bit-exact numerically (boundary nmse unchanged). Reverted by user decision.
+- Approach: revisit only with a register-pressure fix (e.g. merge the 4 b32 LDS reloads into one b128 load). Gate: asm dump <=120 VGPR, scratch 0, then full wall A/B.
+- PROJECTED: unknown until the resource gate passes. Negative resource result as measured.
+
 ### T-8. Weight-layout repack (swizzle) for contiguous grid indices
 
 - Evidence: Phase-3 recommendation 5 - largest engineering cost; defers until T-1/T-2 under-deliver.
@@ -71,6 +77,7 @@ Active and upcoming optimization tasks for the tulpar.cpp fork. Every task lists
 
 ## Done (reference)
 
+- EXP-027 6-way parallel softmax across warps in GQA<6> decode (MEASURED 22.01 -> 22.34 t/s @131k, gqa<6> ~1080.7 -> ~1039 us/call).
 - EXP-025 GQA<6> head batching for decode attention (default ON, opt-out `GGML_FA_DECODE_GQA_BATCH_OFF=1`) - `3165bee7e` (MEASURED 15.30 -> 19.59 t/s @131k, FA decode 37.3 -> 22.13 ms/tok).
 - Tile FA for quantized KV decode @hsk 256 - `66dcba5eb` (MEASURED +39.5% @63k).
 - PATH A fused q4_0 KV staging elimination - `2e033a696` (MEASURED +28.79% @128k).

@@ -318,46 +318,44 @@ static __global__ void flash_attn_decode_rdna3_gqa(
         }
         __syncthreads();
 
-        // Softmax over the 64 tokens of the tile, per head, warp 0 only.
-        if (warp == 0) {
+        // Softmax over the 64 tokens of the tile: warp w handles head w, warps >= NH idle.
+        if (warp < NH) {
+            const int h = warp;
+            float s0_ = 0.0f;
+            float s1_ = 0.0f;
 #pragma unroll
-            for (int h = 0; h < NH; ++h) {
-                float s0_ = 0.0f;
-                float s1_ = 0.0f;
-#pragma unroll
-                for (int w = 0; w < N_WARPS; ++w) {
-                    s0_ += S_lds[h][w*S_LDSS + 2*lane];
-                    s1_ += S_lds[h][w*S_LDSS + 2*lane + 1];
-                }
-                float mx = fmaxf(s0_, s1_);
-                mx = fmaxf(mx, __shfl_down(mx, 16, 32));
-                mx = fmaxf(mx, __shfl_down(mx, 8, 32));
-                mx = fmaxf(mx, __shfl_down(mx, 4, 32));
-                mx = fmaxf(mx, __shfl_down(mx, 2, 32));
-                mx = fmaxf(mx, __shfl_down(mx, 1, 32));
-                mx = __shfl(mx, 0, 32);
-
-                const float m_old = m_shared[h];
-                __syncwarp();
-                const float m_new = fmaxf(m_old, mx);
-                const float e0 = exp2f((s0_ - m_new) * LOG2E);
-                const float e1 = exp2f((s1_ - m_new) * LOG2E);
-                float sum = e0 + e1;
-                sum += __shfl_down(sum, 16, 32);
-                sum += __shfl_down(sum, 8, 32);
-                sum += __shfl_down(sum, 4, 32);
-                sum += __shfl_down(sum, 2, 32);
-                sum += __shfl_down(sum, 1, 32);
-
-                if (lane == 0) {
-                    const float r = exp2f((m_old - m_new) * LOG2E);
-                    lsum_shared[h] = lsum_shared[h]*r + sum;
-                    m_shared[h]    = m_new;
-                    r_shared[h]    = r;
-                }
-                P_lds[h][2*lane]     = e0;
-                P_lds[h][2*lane + 1] = e1;
+            for (int w = 0; w < N_WARPS; ++w) {
+                s0_ += S_lds[h][w*S_LDSS + 2*lane];
+                s1_ += S_lds[h][w*S_LDSS + 2*lane + 1];
             }
+            float mx = fmaxf(s0_, s1_);
+            mx = fmaxf(mx, __shfl_down(mx, 16, 32));
+            mx = fmaxf(mx, __shfl_down(mx, 8, 32));
+            mx = fmaxf(mx, __shfl_down(mx, 4, 32));
+            mx = fmaxf(mx, __shfl_down(mx, 2, 32));
+            mx = fmaxf(mx, __shfl_down(mx, 1, 32));
+            mx = __shfl(mx, 0, 32);
+
+            const float m_old = m_shared[h];
+            __syncwarp();
+            const float m_new = fmaxf(m_old, mx);
+            const float e0 = exp2f((s0_ - m_new) * LOG2E);
+            const float e1 = exp2f((s1_ - m_new) * LOG2E);
+            float sum = e0 + e1;
+            sum += __shfl_down(sum, 16, 32);
+            sum += __shfl_down(sum, 8, 32);
+            sum += __shfl_down(sum, 4, 32);
+            sum += __shfl_down(sum, 2, 32);
+            sum += __shfl_down(sum, 1, 32);
+
+            if (lane == 0) {
+                const float r = exp2f((m_old - m_new) * LOG2E);
+                lsum_shared[h] = lsum_shared[h]*r + sum;
+                m_shared[h]    = m_new;
+                r_shared[h]    = r;
+            }
+            P_lds[h][2*lane]     = e0;
+            P_lds[h][2*lane + 1] = e1;
         }
         __syncthreads();
 
