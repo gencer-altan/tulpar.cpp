@@ -392,7 +392,6 @@ static __global__ void flash_attn_decode_rdna3_gqa(
                 }
             }
         }
-        __syncthreads();
     }
 
     // Merge the 4 token groups (grp) that cover the same dims, per head.
