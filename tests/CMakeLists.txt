@@ -364,3 +364,13 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# RDNA3 (gfx1101) flash-attention decode boundary harness, Qwen3.8-27B GQA-6 topology.
+# Run manually on a gfx1101 GPU; not registered as a ctest case.
+if (GGML_HIP AND NOT GGML_BACKEND_DL)
+    add_executable(fattn_decode_rdna3_boundary fattn_decode_rdna3_boundary.cpp)
+    target_link_libraries(fattn_decode_rdna3_boundary PRIVATE ggml)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS fattn_decode_rdna3_boundary RUNTIME)
+    endif()
+endif()
