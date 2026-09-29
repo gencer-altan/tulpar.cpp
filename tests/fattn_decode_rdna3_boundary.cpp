@@ -7,6 +7,7 @@
 #include <ggml-cpu.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,17 +23,19 @@ namespace {
 constexpr int head_dim   = 256;
 constexpr int n_heads    = 24;
 constexpr int n_kv_heads = 4;
+constexpr int kv_deep    = 129424; // benched by default
 constexpr double nmse_gate = 1e-4;
 
 void usage(const char * prog) {
     std::fprintf(stderr,
-        "usage: %s -kv <11,64,65,129424> [-seed 42] [-o prefix] [-model-view]\n",
+        "usage: %s -kv <11,64,65,129424> [-seed 42] [-o prefix] [-model-view] [-bench]\n",
         prog);
 }
 
-bool parse_args(int argc, char * * argv, std::vector<int> & kvs, int & seed, std::string & out_prefix, bool & model_view) {
+bool parse_args(int argc, char * * argv, std::vector<int> & kvs, int & seed, std::string & out_prefix, bool & model_view, bool & bench) {
     seed = 42;
     model_view = false;
+    bench = false;
     bool have_kvs = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-kv") == 0 && i + 1 < argc) {
@@ -51,14 +54,16 @@ bool parse_args(int argc, char * * argv, std::vector<int> & kvs, int & seed, std
             out_prefix = argv[++i];
         } else if (std::strcmp(argv[i], "-model-view") == 0) {
             model_view = true;
+        } else if (std::strcmp(argv[i], "-bench") == 0) {
+            bench = true;
         } else {
             std::fprintf(stderr, "unknown argument %s\n", argv[i]);
             return false;
         }
     }
     if (!have_kvs) {
-        // deep context kv=129424 exercises the n_splits=60 fold path
-        kvs = {11, 64, 65, 129424};
+        // deep context exercises the n_splits fold path
+        kvs = {11, 64, 65, kv_deep};
     }
     return true;
 }
@@ -87,17 +92,26 @@ std::vector<uint8_t> make_kv(int kv, int seed) {
     return q;
 }
 
-std::vector<float> run_case(ggml_backend_t backend, int kv, int seed, const char * name, bool model_view) {
+struct case_ctx {
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buf;
+    ggml_tensor * out;
+    ggml_cgraph * gf;
+    bool ok;
+};
+
+case_ctx build_case(ggml_backend_t backend, int kv, int seed, const char * name, bool model_view) {
+    case_ctx cc = {};
     ggml_init_params params = {
         /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead(),
         /* .mem_base = */ nullptr,
         /* .no_alloc = */ true,
     };
-    ggml_context_ptr ctx(ggml_init(params));
-    ggml_context * c = ctx.get();
+    cc.ctx = ggml_context_ptr(ggml_init(params));
+    ggml_context * c = cc.ctx.get();
     if (!c) {
         std::fprintf(stderr, "failed to create ggml context\n");
-        return {};
+        return cc;
     }
 
     ggml_tensor * q = ggml_new_tensor_4d(c, GGML_TYPE_F32,  head_dim, 1, n_heads,    1);
@@ -127,16 +141,16 @@ std::vector<float> run_case(ggml_backend_t backend, int kv, int seed, const char
         v = ggml_new_tensor_4d(c, GGML_TYPE_Q4_0, head_dim, kv, n_kv_heads, 1);
     }
 
-    ggml_tensor * out = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f / std::sqrt(head_dim), 0.0f, 0.0f);
+    cc.out = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f / std::sqrt(head_dim), 0.0f, 0.0f);
 
-    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(c, backend));
-    if (!buf) {
+    cc.buf = ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors(c, backend));
+    if (!cc.buf) {
         std::fprintf(stderr, "failed to allocate tensors for %s\n", name);
-        return {};
+        return cc;
     }
 
-    ggml_cgraph * gf = ggml_new_graph(c);
-    ggml_build_forward_expand(gf, out);
+    cc.gf = ggml_new_graph(c);
+    ggml_build_forward_expand(cc.gf, cc.out);
 
     std::vector<float> qf = make_q(seed);
     std::vector<uint8_t> kf = make_kv(kv, seed + 1);
@@ -151,16 +165,43 @@ std::vector<float> run_case(ggml_backend_t backend, int kv, int seed, const char
         ggml_backend_tensor_set(v, vf.data(), 0, vf.size());
     }
 
-    const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    cc.ok = true;
+    return cc;
+}
+
+std::vector<float> run_case(ggml_backend_t backend, int kv, int seed, const char * name, bool model_view) {
+    case_ctx cc = build_case(backend, kv, seed, name, model_view);
+    if (!cc.ok) return {};
+
+    const ggml_status st = ggml_backend_graph_compute(backend, cc.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "ggml_backend_graph_compute failed for %s: %d\n", name, st);
         return {};
     }
 
-    const int64_t nres = out->ne[0] * out->ne[1] * out->ne[2] * out->ne[3];
+    const int64_t nres = cc.out->ne[0] * cc.out->ne[1] * cc.out->ne[2] * cc.out->ne[3];
     std::vector<float> res(nres);
-    ggml_backend_tensor_get(out, res.data(), 0, res.size() * sizeof(float));
+    ggml_backend_tensor_get(cc.out, res.data(), 0, res.size() * sizeof(float));
     return res;
+}
+
+// synchronous compute (async launch + device sync) per call, so chrono wall time is the kernel latency
+void bench_case(ggml_backend_t backend, int kv, int seed, bool model_view) {
+    case_ctx cc = build_case(backend, kv, seed, "gpu-bench", model_view);
+    if (!cc.ok) return;
+    const int n_warmup = 10;
+    const int n_iters  = 50;
+    for (int i = 0; i < n_warmup; ++i) {
+        if (ggml_backend_graph_compute(backend, cc.gf) != GGML_STATUS_SUCCESS) return;
+    }
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < n_iters; ++i) {
+        if (ggml_backend_graph_compute(backend, cc.gf) != GGML_STATUS_SUCCESS) return;
+    }
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_iters;
+    std::printf("BENCHMARK RESULT [kv=%d]: Average kernel latency = %.1f us (throughput = %.1f tok/s equivalent)\n",
+                kv, us, 1.0 / (us * 1e-6));
 }
 
 double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -207,7 +248,8 @@ int main(int argc, char * * argv) {
     int seed = 42;
     std::string out_prefix;
     bool model_view = false;
-    if (!parse_args(argc, argv, kvs, seed, out_prefix, model_view)) {
+    bool bench = false;
+    if (!parse_args(argc, argv, kvs, seed, out_prefix, model_view, bench)) {
         usage(argv[0]);
         return 1;
     }
@@ -249,6 +291,10 @@ int main(int argc, char * * argv) {
             rc = 1;
         }
         write_raw(out_prefix, kv, gpu_res);
+        // deep context is benched by default; -bench times every case
+        if (bench || kv == kv_deep) {
+            bench_case(gpu, kv, seed, model_view);
+        }
     }
 
     return rc;
