@@ -325,6 +325,7 @@ struct cmd_params {
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
     bool                             offline;
+    std::string                      prompt_cache;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -369,6 +370,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_file              */ {},
     /* hf_token             */ "",
     /* offline              */ false,
+    /* prompt_cache         */ "",
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -440,6 +442,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: value from HF_TOKEN environment variable)\n");
     printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
     printf("                                                    (default: disabled)\n");
+    printf("  --prompt-cache <file>                             load/save the depth KV state from/to this file (default: off)\n");
     printf("  -p, --n-prompt <n>                                (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                                   (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
@@ -565,6 +568,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.hf_token = argv[i];
             } else if (arg == "--offline") {
                 params.offline = true;
+            } else if (arg == "--prompt-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.prompt_cache = argv[i];
             } else if (arg == "-p" || arg == "--n-prompt") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2161,6 +2170,27 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     return true;
 }
 
+// load the depth KV state from the prompt-cache file, skipping the prefill
+// the file token count must match n_depth, otherwise the load is rejected
+static bool prompt_cache_load(llama_context * ctx, const std::string & file, int n_depth) {
+    size_t n_tokens = 0;
+    llama_state_seq_load_file(ctx, file.c_str(), 0, nullptr, 0, &n_tokens);
+    if (n_tokens != (size_t) n_depth) {
+        return false;
+    }
+
+    std::vector<llama_token> tokens(n_tokens);
+    const size_t ret = llama_state_seq_load_file(ctx, file.c_str(), 0, tokens.data(), tokens.size(), &n_tokens);
+    return ret > 0;
+}
+
+// save the depth KV state to the prompt-cache file for reuse in later runs
+static bool prompt_cache_save(llama_context * ctx, const std::string & file, int n_depth) {
+    std::vector<llama_token> tokens(n_depth, 0);
+    const size_t ret = llama_state_seq_save_file(ctx, file.c_str(), 0, tokens.data(), tokens.size());
+    return ret > 0;
+}
+
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) text;
@@ -2383,6 +2413,7 @@ int llama_bench(int argc, char ** argv) {
 
             if (t.n_depth > 0) {
                 bool is_cached = t.n_depth == cstate.depth;
+                bool is_file   = false;
 
                 if (is_cached) {
                     // if previously we have computed at this depth, just restore the state
@@ -2390,6 +2421,18 @@ int llama_bench(int argc, char ** argv) {
                     if (ret == 0) {
                         // if the old state is incompatible with the current context - reprocess from scratch
                         is_cached = false;
+                    }
+                }
+
+                // load the depth state from the prompt-cache file to skip the prefill
+                if (!is_cached && !params.prompt_cache.empty()) {
+                    if (prompt_cache_load(ctx, params.prompt_cache, t.n_depth)) {
+                        is_cached = true;
+                        is_file   = true;
+                        // also cache in memory for reuse in later runs
+                        cstate.depth = t.n_depth;
+                        cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
+                        llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
                     }
                 }
 
@@ -2410,10 +2453,17 @@ int llama_bench(int argc, char ** argv) {
                     cstate.depth = t.n_depth;
                     cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
                     llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+
+                    // save the depth state to the prompt-cache file
+                    if (!params.prompt_cache.empty() &&
+                        !prompt_cache_save(ctx, params.prompt_cache, t.n_depth)) {
+                        fprintf(stderr, "%s: warning: failed to save prompt-cache to '%s'\n",
+                                __func__, params.prompt_cache.c_str());
+                    }
                 } else {
                     if (params.progress) {
-                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
-                                i + 1, params.reps);
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d %s\n", params_idx, params_count,
+                                i + 1, params.reps, is_file ? "(prompt-cache)" : "(cached)");
                     }
                 }
             }
