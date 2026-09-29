@@ -191,10 +191,33 @@ static __global__ void flash_attn_decode_rdna3(
     }
 }
 
+// Load one raw Q4_0 sub-block (d + 4 qs dwords) into registers:
+// p is the 18-byte sub-block, kq[0..3] hold qs bytes [2..17] as dwords, *kd the d half.
+static __device__ __forceinline__ void load_k_subblock_regs(
+        const char * p, uint32_t * kq, uint32_t * kd) {
+    *kd = *(const uint16_t *)p;
+    kq[0] = *(const uint16_t *)(p + 2)  | (uint32_t(*(const uint16_t *)(p + 4))  << 16);
+    kq[1] = *(const uint16_t *)(p + 6)  | (uint32_t(*(const uint16_t *)(p + 8))  << 16);
+    kq[2] = *(const uint16_t *)(p + 10) | (uint32_t(*(const uint16_t *)(p + 12)) << 16);
+    kq[3] = *(const uint16_t *)(p + 14) | (uint32_t(*(const uint16_t *)(p + 16)) << 16);
+}
+
+// Stage one prefetched sub-block into LDS: planes [qs0, qs1, qs2, qs3, d] at kidx + plane*stride.
+static __device__ __forceinline__ void flush_k_subblock_lds(
+        uint32_t * K_lds, const uint32_t * kq, const uint32_t kd, const int kidx, const int stride) {
+    K_lds[kidx]             = kq[0];
+    K_lds[stride + kidx]    = kq[1];
+    K_lds[2*stride + kidx]  = kq[2];
+    K_lds[3*stride + kidx]  = kq[3];
+    K_lds[4*stride + kidx]  = kd;
+}
+
 // GQA head batching: one block per (kv_head, split) processes all gqa_ratio query heads.
 // K/V tiles are loaded and dequantized once per tile, reused across the heads.
 // Grid: (n_kv_heads, n_splits) instead of (n_heads, n_splits): 6x less KV traffic.
 // Per-head arithmetic is identical to flash_attn_decode_rdna3 (bit-exact partials).
+// Next-tile K raw bytes are prefetched: global loads issued at the tile start are held
+// in registers and flushed to LDS after the V pass, so VRAM latency overlaps compute.
 template<int NH>
 static __global__ void flash_attn_decode_rdna3_gqa(
         const char * Q,
@@ -215,6 +238,9 @@ static __global__ void flash_attn_decode_rdna3_gqa(
     constexpr int TILE    = 64;
     constexpr int N_WARPS = D / 32;
     constexpr int S_LDSS  = 65;
+    // K LDS stride N_WARPS+1: the KQ read (token = 4g+grp) hits one bank per grp.
+    constexpr int N_KSTRIDE = N_WARPS + 1;
+    constexpr int N_KLDS    = TILE*N_KSTRIDE + N_WARPS;
     constexpr float S_OOB = -1e30f;
     // This file is compiled with -fgpu-flush-denormals-to-zero, so exp2f
     // lowers to bare v_exp_f32 (3 ops) instead of the expf polynomial.
@@ -225,6 +251,8 @@ static __global__ void flash_attn_decode_rdna3_gqa(
     __shared__ float m_shared[NH];
     __shared__ float lsum_shared[NH];
     __shared__ float r_shared[NH];
+    // One tile of raw K: planes [qs0, qs1, qs2, qs3, d] per (token, warp), d in low 16 bits.
+    __shared__ uint32_t K_lds[5*N_KLDS];
 
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
@@ -258,6 +286,31 @@ static __global__ void flash_attn_decode_rdna3_gqa(
         O_acc3[h] = 0.0f;
     }
 
+    const int s0 = split*split_len;
+    const int e0 = s0 + split_len < ne11 ? s0 + split_len : ne11;
+    const int ntiles = (e0 - s0 + TILE - 1) / TILE;
+
+    // Register buffer: one tile of K is 512 sub-blocks, so two per thread.
+    uint32_t kbuf[2][4];
+    uint32_t kdbuf[2];
+    // Tile 0: load and flush to LDS (one-time, no compute to overlap).
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int s = tid + 256*r;
+        const int token = s >> 3;
+        if (s0 + token < e0) {
+            load_k_subblock_regs(K_head + nb11*(s0 + token) + 18*(s & 7), kbuf[r], &kdbuf[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int s = tid + 256*r;
+        const int token = s >> 3;
+        if (s0 + token < e0) {
+            flush_k_subblock_lds(K_lds, kbuf[r], kdbuf[r], token*N_KSTRIDE + (s & 7), N_KLDS);
+        }
+    }
+
     if (tid == 0) {
 #pragma unroll
         for (int h = 0; h < NH; ++h) {
@@ -268,15 +321,24 @@ static __global__ void flash_attn_decode_rdna3_gqa(
     }
     __syncthreads();
 
-    const int s0 = split*split_len;
-    const int e0 = s0 + split_len < ne11 ? s0 + split_len : ne11;
-    const int ntiles = (e0 - s0 + TILE - 1) / TILE;
-
     for (int tile = 0; tile < ntiles; ++tile) {
         const int t0 = s0 + tile*TILE;
+        const int t1 = s0 + (tile + 1)*TILE;
 
-        // KQ: dequant once per (g, lane), partial-dots against all NH heads.
+        // Next tile's K global loads: in flight while this tile computes.
+        if (tile + 1 < ntiles) {
 #pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int s = tid + 256*r;
+                const int token = s >> 3;
+                if (t1 + token < e0) {
+                    load_k_subblock_regs(K_head + nb11*t1 + nb11*token + 18*(s & 7), kbuf[r], &kdbuf[r]);
+                }
+            }
+        }
+
+        // KQ: dequant once per (g, lane) from the prefetched tile, partial-dots against all NH heads.
+        #pragma unroll
         for (int g = 0; g < TILE/4; ++g) {
             const int token = t0 + 4*g + grp;
             const bool valid = token < e0;
@@ -287,12 +349,10 @@ static __global__ void flash_attn_decode_rdna3_gqa(
                 partial[h] = 0.0f;
             }
             if (valid) {
-                const block_q4_0 * blk = (const block_q4_0 *)(K_head + nb11*token) + warp;
-                const float d  = __half2float(blk->d);
+                const int kidx = (4*g + grp)*N_KSTRIDE + warp;
+                const float d  = __half2float(__ushort_as_half((unsigned short)K_lds[4*N_KLDS + kidx]));
                 const float dm = -8.0f*d;
-                const int byte0 = 4 * (l7 & 3);
-                const uint32_t v = *(const uint16_t *)(blk->qs + byte0)
-                                  | (uint32_t(*(const uint16_t *)(blk->qs + byte0 + 2)) << 16);
+                const uint32_t v = K_lds[(l7 & 3)*N_KLDS + kidx];
                 const int nib = (l7 & 4) ? 4 : 0;
                 const float k0 = d*float((v >> (0*8 + nib)) & 0x0F) + dm;
                 const float k1 = d*float((v >> (1*8 + nib)) & 0x0F) + dm;
@@ -367,11 +427,12 @@ static __global__ void flash_attn_decode_rdna3_gqa(
             O_acc2[h] *= r_shared[h];
             O_acc3[h] *= r_shared[h];
         }
+        const char * V_blk = V_head + nb21*(t0 + grp) + 18*warp;
 #pragma unroll
         for (int g = 0; g < TILE/4; ++g) {
             const int token = t0 + 4*g + grp;
             if (token < e0) {
-                const block_q4_0 * blk = (const block_q4_0 *)(V_head + nb21*token) + warp;
+                const block_q4_0 * blk = (const block_q4_0 *)(V_blk + g*nb21*4);
                 const float d  = __half2float(blk->d);
                 const float dm = -8.0f*d;
                 const int byte0 = 4 * (l7 & 3);
@@ -391,6 +452,19 @@ static __global__ void flash_attn_decode_rdna3_gqa(
                     O_acc3[h] = fmaf(p, v3, O_acc3[h]);
                 }
             }
+        }
+
+        // Flush the next tile's K registers to LDS, then release them to the KQ.
+        if (tile + 1 < ntiles) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int s = tid + 256*r;
+                const int token = s >> 3;
+                if (t1 + token < e0) {
+                    flush_k_subblock_lds(K_lds, kbuf[r], kdbuf[r], token*N_KSTRIDE + (s & 7), N_KLDS);
+                }
+            }
+            __syncthreads();
         }
     }
 
