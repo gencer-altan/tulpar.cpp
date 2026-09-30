@@ -591,7 +591,7 @@ bool ggml_cuda_flash_attn_ext_decode_rdna3(ggml_backend_cuda_context & ctx, ggml
     // GQA batching: one block per kv head, so split budget is per kv head.
     const bool  use_gqa     = gqa_batch && gqa_ratio == 6;
     const int   n_kv_heads  = n_heads / gqa_ratio;
-    const int   max_splits  = (use_gqa ? 512 : 256) / (use_gqa ? n_kv_heads : n_heads);
+    const int   max_splits  = (use_gqa ? 480 : 240) / (use_gqa ? n_kv_heads : n_heads);
     if (max_splits < 1) {
         return false;
     }
