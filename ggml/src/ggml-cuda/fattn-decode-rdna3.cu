@@ -420,6 +420,17 @@ static __global__ void flash_attn_decode_rdna3_gqa(
         __syncthreads();
 
         // V: rescale the accumulators, then O_acc += P * V. V dequant shared across heads.
+        // Raw V bytes (d + nibbles) are prefetched one token ahead so the global
+        // load overlaps the dequant + FMA of the previous token.
+        const char * V_blk = V_head + nb21*(t0 + grp) + 18*warp;
+        const int byte0 = 4 * (l7 & 3);
+        uint16_t vnd_next = 0;
+        uint32_t vns_next = 0;
+        if (t0 + grp < e0) {
+            vnd_next = *(const uint16_t *)V_blk;
+            vns_next = *(const uint16_t *)(V_blk + 2 + byte0)
+                     | (uint32_t(*(const uint16_t *)(V_blk + 4 + byte0)) << 16);
+        }
 #pragma unroll
         for (int h = 0; h < NH; ++h) {
             O_acc0[h] *= r_shared[h];
@@ -427,22 +438,26 @@ static __global__ void flash_attn_decode_rdna3_gqa(
             O_acc2[h] *= r_shared[h];
             O_acc3[h] *= r_shared[h];
         }
-        const char * V_blk = V_head + nb21*(t0 + grp) + 18*warp;
 #pragma unroll
         for (int g = 0; g < TILE/4; ++g) {
             const int token = t0 + 4*g + grp;
+            const uint16_t vnd_cur = vnd_next;
+            const uint32_t vns_cur = vns_next;
+            const int token_n = t0 + 4*(g + 1) + grp;
+            if (g + 1 < TILE/4 && token_n < e0) {
+                const char * V_n = V_blk + (g + 1)*nb21*4;
+                vnd_next = *(const uint16_t *)V_n;
+                vns_next = *(const uint16_t *)(V_n + 2 + byte0)
+                         | (uint32_t(*(const uint16_t *)(V_n + 4 + byte0)) << 16);
+            }
             if (token < e0) {
-                const block_q4_0 * blk = (const block_q4_0 *)(V_blk + g*nb21*4);
-                const float d  = __half2float(blk->d);
+                const float d  = __half2float(__ushort_as_half((unsigned short)vnd_cur));
                 const float dm = -8.0f*d;
-                const int byte0 = 4 * (l7 & 3);
-                const uint32_t v = *(const uint16_t *)(blk->qs + byte0)
-                                  | (uint32_t(*(const uint16_t *)(blk->qs + byte0 + 2)) << 16);
                 const int nib = (l7 & 4) ? 4 : 0;
-                const float v0 = d*float((v >> (0*8 + nib)) & 0x0F) + dm;
-                const float v1 = d*float((v >> (1*8 + nib)) & 0x0F) + dm;
-                const float v2 = d*float((v >> (2*8 + nib)) & 0x0F) + dm;
-                const float v3 = d*float((v >> (3*8 + nib)) & 0x0F) + dm;
+                const float v0 = d*float((vns_cur >> (0*8 + nib)) & 0x0F) + dm;
+                const float v1 = d*float((vns_cur >> (1*8 + nib)) & 0x0F) + dm;
+                const float v2 = d*float((vns_cur >> (2*8 + nib)) & 0x0F) + dm;
+                const float v3 = d*float((vns_cur >> (3*8 + nib)) & 0x0F) + dm;
 #pragma unroll
                 for (int h = 0; h < NH; ++h) {
                     const float p = P_lds[h][4*g + grp];
@@ -576,7 +591,7 @@ bool ggml_cuda_flash_attn_ext_decode_rdna3(ggml_backend_cuda_context & ctx, ggml
     // GQA batching: one block per kv head, so split budget is per kv head.
     const bool  use_gqa     = gqa_batch && gqa_ratio == 6;
     const int   n_kv_heads  = n_heads / gqa_ratio;
-    const int   max_splits  = (use_gqa ? 480 : 240) / (use_gqa ? n_kv_heads : n_heads);
+    const int   max_splits  = (use_gqa ? 512 : 256) / (use_gqa ? n_kv_heads : n_heads);
     if (max_splits < 1) {
         return false;
     }
