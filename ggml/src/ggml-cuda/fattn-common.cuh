@@ -975,7 +975,12 @@ static __global__ void flash_attn_combine_results(
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
+#if defined(__HIP_PLATFORM_AMD__)
+        const float diff = meta[l].x - kqmax;
+        const float KQ_max_scale = diff >= SOFTMAX_FTZ_THRESHOLD ? __builtin_amdgcn_exp2f(diff * 1.4426950408889634f) : 0.0f;
+#else
         const float KQ_max_scale = expf(meta[l].x - kqmax);
+#endif
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
