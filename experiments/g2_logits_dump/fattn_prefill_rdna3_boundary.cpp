@@ -22,13 +22,14 @@ constexpr int n_kv_heads = 4;
 constexpr double kDevThreshold = 1e-4;
 
 void usage(const char * prog) {
-    std::fprintf(stderr, "usage: %s [-ntokens N] [-nkv N] [-seed 42] [-o prefix]\n", prog);
+    std::fprintf(stderr, "usage: %s [-ntokens N] [-nkv N] [-seed 42] [-mask] [-o prefix]\n", prog);
 }
 
-bool parse_args(int argc, char * * argv, int & n_tokens, int & n_kv, int & seed, std::string & out_prefix) {
+bool parse_args(int argc, char * * argv, int & n_tokens, int & n_kv, int & seed, bool & use_mask, std::string & out_prefix) {
     n_tokens = 512;
     n_kv = 512;
     seed = 42;
+    use_mask = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-ntokens") == 0 && i + 1 < argc) {
             n_tokens = std::stoi(argv[++i]);
@@ -36,6 +37,8 @@ bool parse_args(int argc, char * * argv, int & n_tokens, int & n_kv, int & seed,
             n_kv = std::stoi(argv[++i]);
         } else if (std::strcmp(argv[i], "-seed") == 0 && i + 1 < argc) {
             seed = std::stoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "-mask") == 0) {
+            use_mask = true;
         } else if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             out_prefix = argv[++i];
         } else {
@@ -70,7 +73,7 @@ std::vector<uint8_t> make_kv(int n_kv, int seed) {
     return q;
 }
 
-std::vector<float> run_case(ggml_backend_t backend, int n_tokens, int n_kv, int seed) {
+std::vector<float> run_case(ggml_backend_t backend, int n_tokens, int n_kv, int seed, bool use_mask) {
     ggml_init_params params = {
         /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead(),
         /* .mem_base = */ nullptr,
@@ -87,7 +90,21 @@ std::vector<float> run_case(ggml_backend_t backend, int n_tokens, int n_kv, int 
     ggml_tensor * k = ggml_new_tensor_4d(c, GGML_TYPE_Q4_0, head_dim, n_kv, n_kv_heads, 1);
     ggml_tensor * v = ggml_new_tensor_4d(c, GGML_TYPE_Q4_0, head_dim, n_kv, n_kv_heads, 1);
 
-    ggml_tensor * out = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f / std::sqrt(head_dim), 0.0f, 0.0f);
+    ggml_tensor * mask = nullptr;
+    std::vector<ggml_fp16_t> mask_data;
+    if (use_mask) {
+        mask = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv, n_tokens);
+        mask_data.resize(static_cast<size_t>(n_kv) * n_tokens);
+        // causal: q token jv attends to kv i <= jv  ->  mask[i][jv] = -inf when i > jv
+        for (int jv = 0; jv < n_tokens; ++jv) {
+            for (int i = 0; i < n_kv; ++i) {
+                mask_data[static_cast<size_t>(jv) * n_kv + i] =
+                    ggml_fp32_to_fp16(i > jv ? -INFINITY : 0.0f);
+            }
+        }
+    }
+
+    ggml_tensor * out = ggml_flash_attn_ext(c, q, k, v, mask, 1.0f / std::sqrt(head_dim), 0.0f, 0.0f);
 
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(c, backend));
     if (!buf) {
@@ -105,6 +122,9 @@ std::vector<float> run_case(ggml_backend_t backend, int n_tokens, int n_kv, int 
     ggml_backend_tensor_set(q, qf.data(), 0, qf.size() * sizeof(float));
     ggml_backend_tensor_set(k, kf.data(), 0, kf.size());
     ggml_backend_tensor_set(v, vf.data(), 0, vf.size());
+    if (mask) {
+        ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
 
     const ggml_status st = ggml_backend_graph_compute(backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
@@ -164,8 +184,9 @@ void write_raw(const std::string & prefix, int n_tokens, int n_kv, const std::ve
 
 int main(int argc, char * * argv) {
     int n_tokens, n_kv, seed;
+    bool use_mask;
     std::string out_prefix;
-    if (!parse_args(argc, argv, n_tokens, n_kv, seed, out_prefix)) {
+    if (!parse_args(argc, argv, n_tokens, n_kv, seed, use_mask, out_prefix)) {
         usage(argv[0]);
         return 1;
     }
@@ -181,8 +202,8 @@ int main(int argc, char * * argv) {
         return 1;
     }
 
-    std::vector<float> cpu_res = run_case(cpu, n_tokens, n_kv, seed);
-    std::vector<float> gpu_res = run_case(gpu, n_tokens, n_kv, seed);
+    std::vector<float> cpu_res = run_case(cpu, n_tokens, n_kv, seed, use_mask);
+    std::vector<float> gpu_res = run_case(gpu, n_tokens, n_kv, seed, use_mask);
     if (cpu_res.empty() || gpu_res.empty() || cpu_res.size() != gpu_res.size()) {
         std::fprintf(stderr, "failed to get results\n");
         return 1;
