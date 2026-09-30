@@ -219,7 +219,7 @@ static __device__ __forceinline__ void flush_k_subblock_lds(
 // Next-tile K raw bytes are prefetched: global loads issued at the tile start are held
 // in registers and flushed to LDS after the V pass, so VRAM latency overlaps compute.
 template<int NH>
-static __global__ void flash_attn_decode_rdna3_gqa(
+static __global__ void __launch_bounds__(256, 2) flash_attn_decode_rdna3_gqa(
         const char * Q,
         const char * K,
         const char * V,
