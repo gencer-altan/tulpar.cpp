@@ -259,11 +259,13 @@ static __global__ void flash_attn_prefill_d256_rdna3_kernel(
         KQ_max = KQ_max_new;
         *((uint32_t *) &KQ_max_scale) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
 
-        #pragma unroll
-        for (int f = 0; f < 16; ++f) {
+        if (KQ_max_scale < 1.0f) {
             #pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[f].x[l] = VKQ_C[f].x[l] * KQ_max_scale;
+            for (int f = 0; f < 16; ++f) {
+                #pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[f].x[l] *= KQ_max_scale;
+                }
             }
         }
 
